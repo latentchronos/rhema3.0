@@ -22,6 +22,7 @@ pub fn run() {
         .manage(Mutex::new(rhema_detection::DirectDetector::new()))
         .manage(Mutex::new(rhema_detection::DetectionMerger::new()))
         .manage(Mutex::new(rhema_detection::ReadingMode::new()))
+        .manage(Mutex::new(commands::obs::ObsOverlayServer::default()))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -50,6 +51,10 @@ pub fn run() {
             commands::broadcast::stop_ndi,
             commands::broadcast::get_ndi_status,
             commands::broadcast::push_ndi_frame,
+            commands::obs::start_obs_overlay,
+            commands::obs::stop_obs_overlay,
+            commands::obs::get_obs_overlay_status,
+            commands::obs::push_obs_overlay,
         ])
         .setup(|app| {
             use tauri::Manager;

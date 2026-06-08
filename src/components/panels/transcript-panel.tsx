@@ -80,7 +80,10 @@ export function TranscriptPanel() {
     // Auto-navigate book search + select verse for preview/live
     // Handle direct, contextual (reading mode), and high-confidence quotation matches
     const directHit = detections.find(
-      (d) => d.source === "direct" || d.source === "contextual" || (d.source === "quotation" && d.auto_queued)
+      (d) =>
+        d.source === "direct" ||
+        d.source === "contextual" ||
+        (d.source === "quotation" && d.auto_queued)
     )
     if (directHit && directHit.book_number > 0) {
       // Select verse immediately so preview/live panels update
@@ -95,13 +98,11 @@ export function TranscriptPanel() {
         text: directHit.verse_text,
       })
       // Navigate book search panel to this verse
-      useBibleStore
-        .getState()
-        .setPendingNavigation({
-          bookNumber: directHit.book_number,
-          chapter: directHit.chapter,
-          verse: directHit.verse,
-        })
+      useBibleStore.getState().setPendingNavigation({
+        bookNumber: directHit.book_number,
+        chapter: directHit.chapter,
+        verse: directHit.verse,
+      })
     }
 
     // Auto-queue high-confidence detections
@@ -121,7 +122,12 @@ export function TranscriptPanel() {
           },
           reference: d.verse_ref,
           confidence: d.confidence,
-          source: d.source === "direct" ? "ai-direct" : "ai-semantic",
+          source:
+            d.source === "direct" || d.source === "contextual"
+              ? "ai-direct"
+              : d.source === "semantic_cloud"
+                ? "ai-cloud"
+                : "ai-semantic",
           added_at: Date.now(),
         })
       }
@@ -140,11 +146,22 @@ export function TranscriptPanel() {
       useTranscriptStore.getState().setConnectionStatus("connecting")
       const { useSettingsStore } = await import("@/stores")
       const settings = useSettingsStore.getState()
-      console.log("[AUDIO] Starting with deviceId:", settings.audioDeviceId, "gain:", settings.gain)
+      console.log(
+        "[AUDIO] Starting with deviceId:",
+        settings.audioDeviceId,
+        "gain:",
+        settings.gain,
+        "channel:",
+        settings.audioChannelIndex,
+        "vad:",
+        settings.vadEnabled
+      )
       await invoke("start_transcription", {
         apiKey: deepgramApiKey ?? "",
         deviceId: settings.audioDeviceId,
         gain: settings.gain,
+        channelIndex: settings.audioChannelIndex,
+        vadEnabled: settings.vadEnabled,
       })
       useTranscriptStore.getState().setTranscribing(true)
     } catch (e) {
@@ -249,7 +266,7 @@ export function TranscriptPanel() {
           </Button>
         ) : (
           <Button variant="ghost" size="sm" onClick={handleStart}>
-              <MicIcon className="size-3" />
+            <MicIcon className="size-3" />
             Start transcribing
           </Button>
         )}

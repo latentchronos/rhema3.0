@@ -17,6 +17,11 @@ pub struct DetectionResult {
     pub confidence: f64,
     pub source: String,
     pub auto_queued: bool,
+    pub raw_score: f64,
+    pub minimum_threshold: f64,
+    pub auto_queue_threshold: f64,
+    pub decision: String,
+    pub explanation: String,
     pub transcript_snippet: String,
 }
 
@@ -43,25 +48,58 @@ pub fn to_result(state: &AppState, merged: &MergedDetection) -> DetectionResult 
                 (r, v.text, v.book_name, v.book_number, v.chapter, v.verse)
             } else {
                 let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                (
+                    r,
+                    String::new(),
+                    vr.book_name.clone(),
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                )
             }
         } else if let Some(ref db) = state.bible_db {
             // Direct detection: resolve via book/chapter/verse
             if vr.book_number > 0 && vr.chapter > 0 && vr.verse_start > 0 {
-                if let Ok(Some(v)) = db.get_verse(state.active_translation_id, vr.book_number, vr.chapter, vr.verse_start) {
+                if let Ok(Some(v)) = db.get_verse(
+                    state.active_translation_id,
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                ) {
                     let r = format!("{} {}:{}", v.book_name, v.chapter, v.verse);
                     (r, v.text, v.book_name, v.book_number, v.chapter, v.verse)
                 } else {
                     let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                    (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                    (
+                        r,
+                        String::new(),
+                        vr.book_name.clone(),
+                        vr.book_number,
+                        vr.chapter,
+                        vr.verse_start,
+                    )
                 }
             } else {
                 let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                (
+                    r,
+                    String::new(),
+                    vr.book_name.clone(),
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                )
             }
         } else {
             let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-            (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+            (
+                r,
+                String::new(),
+                vr.book_name.clone(),
+                vr.book_number,
+                vr.chapter,
+                vr.verse_start,
+            )
         };
 
     DetectionResult {
@@ -74,8 +112,53 @@ pub fn to_result(state: &AppState, merged: &MergedDetection) -> DetectionResult 
         confidence: merged.detection.confidence,
         source: source_to_string(&merged.detection.source),
         auto_queued: merged.auto_queued,
+        raw_score: merged.decision.raw_score,
+        minimum_threshold: merged.decision.minimum_threshold,
+        auto_queue_threshold: merged.decision.auto_queue_threshold,
+        decision: merged.decision.decision.to_string(),
+        explanation: merged.decision.explanation.clone(),
         transcript_snippet: merged.detection.transcript_snippet.clone(),
     }
+}
+
+pub fn live_detection_metadata(
+    source: &str,
+    confidence: f64,
+    auto_queued: bool,
+) -> (f64, f64, f64, String, String) {
+    let (minimum_threshold, auto_queue_threshold, label) = match source {
+        "direct" => (0.45, 0.90, "direct reference"),
+        "contextual" => (0.45, 0.80, "reading context"),
+        "quotation" => (0.45, 0.85, "quotation match"),
+        "semantic_cloud" => (0.55, 0.90, "cloud semantic search"),
+        _ => (0.50, 0.92, "local semantic search"),
+    };
+    let decision = if auto_queued {
+        "auto_queued"
+    } else {
+        "review_required"
+    };
+    let explanation = if auto_queued {
+        format!(
+            "{label} confidence {:.0}% met the {:.0}% auto-queue threshold.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        )
+    } else {
+        format!(
+            "{label} confidence {:.0}% is below the {:.0}% auto-queue threshold; operator review required.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        )
+    };
+
+    (
+        confidence,
+        minimum_threshold,
+        auto_queue_threshold,
+        decision.to_string(),
+        explanation,
+    )
 }
 
 /// Run the detection pipeline on a piece of transcript text
@@ -148,7 +231,10 @@ pub fn semantic_search(
         return Err("Semantic search not available — model or embeddings not loaded".into());
     }
 
-    let hits = app_state.detection_pipeline.semantic.search_query(&query, k);
+    let hits = app_state
+        .detection_pipeline
+        .semantic
+        .search_query(&query, k);
 
     let mut results: Vec<SemanticSearchResult> = hits
         .into_iter()
@@ -171,7 +257,11 @@ pub fn semantic_search(
         .collect();
 
     // Ensure highest similarity is always first
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(results)
 }
@@ -259,9 +349,7 @@ pub struct ReadingModeStatus {
 
 /// Stop reading mode
 #[tauri::command]
-pub fn stop_reading_mode(
-    state: State<'_, Mutex<ReadingMode>>,
-) -> Result<(), String> {
+pub fn stop_reading_mode(state: State<'_, Mutex<ReadingMode>>) -> Result<(), String> {
     let mut rm = state.lock().map_err(|e| e.to_string())?;
     rm.deactivate();
     Ok(())

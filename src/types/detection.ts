@@ -6,8 +6,18 @@ export interface DetectionResult {
   chapter: number
   verse: number
   confidence: number
-  source: "direct" | "semantic_local" | "semantic_cloud"
+  source:
+    | "direct"
+    | "contextual"
+    | "quotation"
+    | "semantic_local"
+    | "semantic_cloud"
   auto_queued: boolean
+  raw_score: number
+  minimum_threshold: number
+  auto_queue_threshold: number
+  decision: "auto_queued" | "review_required"
+  explanation: string
   transcript_snippet: string
 }
 

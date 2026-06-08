@@ -78,8 +78,12 @@ function AudioSection() {
   const {
     audioDeviceId,
     setAudioDeviceId,
+    audioChannelIndex,
+    setAudioChannelIndex,
     gain,
     setGain,
+    vadEnabled,
+    setVadEnabled,
   } = useSettingsStore()
 
   const [devices, setDevices] = useState<DeviceInfo[]>([])
@@ -104,6 +108,10 @@ function AudioSection() {
 
   // gain is 0.0-2.0 in store, display as 0-100%
   const gainPercent = Math.round((gain / 2.0) * 100)
+  const selectedDevice =
+    devices.find((device) => device.id === audioDeviceId) ??
+    devices.find((device) => device.is_default)
+  const channelCount = selectedDevice?.channels ?? 1
 
   return (
     <div className="flex flex-col gap-6">
@@ -114,7 +122,10 @@ function AudioSection() {
         </label>
         <Select
           value={audioDeviceId ?? "__default__"}
-          onValueChange={(v) => setAudioDeviceId(v === "__default__" ? null : v)}
+          onValueChange={(v) => {
+            setAudioDeviceId(v === "__default__" ? null : v)
+            setAudioChannelIndex(null)
+          }}
           disabled={loading}
         >
           <SelectTrigger className="h-8 text-xs">
@@ -138,6 +149,38 @@ function AudioSection() {
         </p>
       </div>
 
+      {channelCount > 1 && (
+        <div className="flex flex-col gap-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Input Channel
+          </label>
+          <Select
+            value={
+              audioChannelIndex === null ? "__mix__" : String(audioChannelIndex)
+            }
+            onValueChange={(v) =>
+              setAudioChannelIndex(v === "__mix__" ? null : Number(v))
+            }
+          >
+            <SelectTrigger className="h-8 text-xs">
+              <SelectValue placeholder="Mix all channels" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__mix__">Mix all channels</SelectItem>
+              {Array.from({ length: channelCount }, (_, index) => (
+                <SelectItem key={index} value={String(index)}>
+                  Channel {index + 1}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-[0.625rem] text-muted-foreground">
+            Choose one mixer channel when speech is isolated, or mix all channels
+            for simple microphone setups.
+          </p>
+        </div>
+      )}
+
       {/* Input gain */}
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
@@ -159,6 +202,27 @@ function AudioSection() {
           Amplifies the incoming audio signal before transcription. 50% is unity
           gain.
         </p>
+      </div>
+
+      <div className="flex items-start justify-between gap-4 rounded-lg border p-3">
+        <div className="flex flex-col gap-1">
+          <span className="text-xs font-medium text-foreground">
+            Voice Activity Detection
+          </span>
+          <p className="text-[0.625rem] leading-relaxed text-muted-foreground">
+            Gate silence locally before audio is sent to transcription. Leave off
+            if your mixer or transcription provider already handles silence well.
+          </p>
+        </div>
+        <Button
+          type="button"
+          size="sm"
+          variant={vadEnabled ? "default" : "outline"}
+          onClick={() => setVadEnabled(!vadEnabled)}
+          className="h-8 min-w-14 text-xs"
+        >
+          {vadEnabled ? "On" : "Off"}
+        </Button>
       </div>
     </div>
   )

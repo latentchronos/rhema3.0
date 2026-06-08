@@ -8,7 +8,7 @@ use crate::events::{
     EVENT_TRANSCRIPT_PARTIAL,
 };
 use crate::state::AppState;
-use rhema_audio::{AudioConfig, AudioFrame};
+use rhema_audio::{AudioConfig, AudioFrame, Vad, VadConfig, VadTransition};
 use rhema_stt::{DeepgramClient, SttConfig, TranscriptEvent};
 
 /// Start the full audio-capture-to-transcription pipeline.
@@ -26,6 +26,8 @@ pub async fn start_transcription(
     api_key: String,
     device_id: Option<String>,
     gain: Option<f32>,
+    channel_index: Option<u16>,
+    vad_enabled: Option<bool>,
 ) -> Result<(), String> {
     // ── 1. Guard: already running? ──────────────────────────────────────
     let (stt_active, audio_active) = {
@@ -44,11 +46,20 @@ pub async fn start_transcription(
     };
 
     if resolved_api_key.is_empty() {
-        return Err("No Deepgram API key provided. Set it in Settings or via DEEPGRAM_API_KEY env var.".into());
+        return Err(
+            "No Deepgram API key provided. Set it in Settings or via DEEPGRAM_API_KEY env var."
+                .into(),
+        );
     }
 
-    log::info!("Starting transcription: api_key={}..., device_id={:?}, gain={:?}",
-        &resolved_api_key[..8.min(resolved_api_key.len())], device_id, gain);
+    log::info!(
+        "Starting transcription: api_key={}..., device_id={:?}, gain={:?}, channel_index={:?}, vad_enabled={:?}",
+        &resolved_api_key[..8.min(resolved_api_key.len())],
+        device_id,
+        gain,
+        channel_index,
+        vad_enabled
+    );
 
     stt_active.store(true, Ordering::SeqCst);
     audio_active.store(true, Ordering::SeqCst);
@@ -65,6 +76,8 @@ pub async fn start_transcription(
     //   c) computes levels → emits audio_level events
     //   d) forwards samples to Deepgram via crossbeam
     let gain_val = gain.unwrap_or(1.0).clamp(0.0, 2.0);
+    let selected_channel = channel_index;
+    let use_vad = vad_enabled.unwrap_or(false);
     let fan_active = stt_active.clone();
     let fan_app = app.clone();
 
@@ -75,6 +88,8 @@ pub async fn start_transcription(
                 device_id,
                 sample_rate: 16_000,
                 gain: gain_val,
+                channel_index: selected_channel,
+                vad_enabled: use_vad,
             };
 
             let (audio_tx, audio_rx) = crossbeam_channel::bounded::<AudioFrame>(64);
@@ -92,6 +107,7 @@ pub async fn start_transcription(
             log::info!("Audio capture started on fanout thread");
 
             let mut frame_count: u64 = 0;
+            let mut vad = use_vad.then(|| Vad::new(VadConfig::default()));
 
             loop {
                 if !fan_active.load(Ordering::SeqCst) {
@@ -115,11 +131,25 @@ pub async fn start_transcription(
                             );
                         }
 
-                        // (b) Forward all audio to Deepgram
-                        // NOTE: VAD module exists (audio/vad.rs) but disabled —
-                        // Deepgram's built-in VAD handles silence detection.
-                        // Re-enable when VAD thresholds are properly tuned.
-                        let _ = deepgram_tx.try_send(frame.samples);
+                        // (b) Forward audio to Deepgram, optionally gated by local VAD.
+                        if let Some(vad) = vad.as_mut() {
+                            let result = vad.process(&frame);
+                            match result.transition {
+                                Some(VadTransition::SpeechStarted) => {
+                                    let _ = fan_app.emit("stt_speech_started", ());
+                                }
+                                Some(VadTransition::SpeechEnded) => {
+                                    let _ = fan_app.emit("stt_speech_ended", ());
+                                }
+                                None => {}
+                            }
+
+                            for vad_frame in result.frames {
+                                let _ = deepgram_tx.try_send(vad_frame.samples);
+                            }
+                        } else {
+                            let _ = deepgram_tx.try_send(frame.samples);
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -367,7 +397,7 @@ pub async fn start_transcription(
 /// never blocks on the semantic worker, and cooldown state persists across calls.
 /// Returns true if high-confidence results were found (>= 0.90).
 fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
-    use rhema_detection::{DirectDetector, DetectionMerger};
+    use rhema_detection::{DetectionMerger, DirectDetector};
 
     let detector_state: State<'_, Mutex<DirectDetector>> = app.state();
     let mut detector = match detector_state.lock() {
@@ -423,12 +453,21 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
                         confidence: m.detection.confidence,
                         source: "direct".to_string(),
                         auto_queued: m.auto_queued,
+                        raw_score: m.decision.raw_score,
+                        minimum_threshold: m.decision.minimum_threshold,
+                        auto_queue_threshold: m.decision.auto_queue_threshold,
+                        decision: m.decision.decision.to_string(),
+                        explanation: m.decision.explanation.clone(),
                         transcript_snippet: m.detection.transcript_snippet.clone(),
                     }
                 })
                 .collect();
             for r in &results {
-                log::info!("[DET-DIRECT] Found: {} ({:.0}%) (no DB)", r.verse_ref, r.confidence * 100.0);
+                log::info!(
+                    "[DET-DIRECT] Found: {} ({:.0}%) (no DB)",
+                    r.verse_ref,
+                    r.confidence * 100.0
+                );
             }
             let _ = app.emit("verse_detections", &results);
             return has_high_confidence;
@@ -441,15 +480,17 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
 
     // Update sermon context with direct detection results
     for m in &merged {
-        app_state.sermon_context.update(
-            &m.detection.verse_ref,
-            m.detection.confidence,
-            "direct",
-        );
+        app_state
+            .sermon_context
+            .update(&m.detection.verse_ref, m.detection.confidence, "direct");
     }
 
     for r in &results {
-        log::info!("[DET-DIRECT] Found: {} ({:.0}%)", r.verse_ref, r.confidence * 100.0);
+        log::info!(
+            "[DET-DIRECT] Found: {} ({:.0}%)",
+            r.verse_ref,
+            r.confidence * 100.0
+        );
     }
     drop(app_state);
     let _ = app.emit("verse_detections", &results);
@@ -458,7 +499,10 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
 
 /// Run semantic (ONNX embedding) detection. Slow, runs in background worker.
 fn run_semantic_detection(app: &AppHandle, transcript: &str) {
-    log::info!("[DET-SEMANTIC] Running on: {:?}", &transcript[..transcript.len().min(80)]);
+    log::info!(
+        "[DET-SEMANTIC] Running on: {:?}",
+        &transcript[..transcript.len().min(80)]
+    );
     let managed: State<'_, Mutex<AppState>> = app.state();
     let mut app_state = match managed.lock() {
         Ok(s) => s,
@@ -500,7 +544,10 @@ fn run_semantic_detection(app: &AppHandle, transcript: &str) {
     for r in &results {
         log::info!(
             "[DET-SEMANTIC] Found: {} ({:.0}% {}) auto_q={}",
-            r.verse_ref, r.confidence * 100.0, r.source, r.auto_queued
+            r.verse_ref,
+            r.confidence * 100.0,
+            r.source,
+            r.auto_queued
         );
     }
     drop(app_state);
@@ -530,7 +577,9 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
             // Get the confidence of the detection to distinguish explicit refs from false positives
             let detection_confidence = {
                 let detector_state: State<'_, Mutex<rhema_detection::DirectDetector>> = app.state();
-                detector_state.lock().ok()
+                detector_state
+                    .lock()
+                    .ok()
                     .and_then(|d| d.recent_detections.front().map(|_| 0.95)) // Direct detections are always high confidence
                     .unwrap_or(0.0)
             };
@@ -545,10 +594,12 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
                             // Paused — restart on any new explicit reference
                             true
                         } else if rm.current_book() == recent.book_number
-                            && rm.current_chapter() == recent.chapter {
+                            && rm.current_chapter() == recent.chapter
+                        {
                             false // Same book+chapter — already tracking this
                         } else if rm.current_book() != recent.book_number
-                            && detection_confidence >= 0.90 {
+                            && detection_confidence >= 0.90
+                        {
                             // Different book with high confidence — explicit new reference
                             // (e.g., "John 1:1" after reading Exodus). Restart.
                             true
@@ -572,7 +623,13 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
                         Err(_) => return,
                     };
                     match &app_state.bible_db {
-                        Some(db) => db.get_chapter(app_state.active_translation_id, recent.book_number, recent.chapter).ok(),
+                        Some(db) => db
+                            .get_chapter(
+                                app_state.active_translation_id,
+                                recent.book_number,
+                                recent.chapter,
+                            )
+                            .ok(),
                         None => None,
                     }
                 };
@@ -615,6 +672,10 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
         let _ = app.emit("reading_mode_verse", &advance);
 
         // Also emit as a verse_detection so it appears in the detections panel
+        let confidence = advance.confidence;
+        let auto_queued = true;
+        let (raw_score, minimum_threshold, auto_queue_threshold, decision, explanation) =
+            super::detection::live_detection_metadata("contextual", confidence, auto_queued);
         let result = super::detection::DetectionResult {
             verse_ref: advance.reference.clone(),
             verse_text: advance.verse_text.clone(),
@@ -622,9 +683,14 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
             book_number: advance.book_number,
             chapter: advance.chapter,
             verse: advance.verse,
-            confidence: advance.confidence,
+            confidence,
             source: "contextual".to_string(),
-            auto_queued: true,
+            auto_queued,
+            raw_score,
+            minimum_threshold,
+            auto_queue_threshold,
+            decision,
+            explanation,
             transcript_snippet: String::new(),
         };
         let _ = app.emit("verse_detections", &vec![result]);
@@ -662,10 +728,13 @@ fn check_translation_command(app: &AppHandle, transcript: &str) {
                         abbreviation: String,
                         translation_id: i64,
                     }
-                    let _ = app.emit("translation_command", TranslationSwitch {
-                        abbreviation: abbrev,
-                        translation_id: t.id,
-                    });
+                    let _ = app.emit(
+                        "translation_command",
+                        TranslationSwitch {
+                            abbreviation: abbrev,
+                            translation_id: t.id,
+                        },
+                    );
                 }
             }
         }
@@ -722,6 +791,10 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
                 String::new()
             };
 
+            let auto_queued = d.confidence >= 0.85;
+            let (raw_score, minimum_threshold, auto_queue_threshold, decision, explanation) =
+                super::detection::live_detection_metadata("quotation", d.confidence, auto_queued);
+
             super::detection::DetectionResult {
                 verse_ref: format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start),
                 verse_text,
@@ -731,7 +804,12 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
                 verse: vr.verse_start,
                 confidence: d.confidence,
                 source: "quotation".to_string(),
-                auto_queued: d.confidence >= 0.85,
+                auto_queued,
+                raw_score,
+                minimum_threshold,
+                auto_queue_threshold,
+                decision,
+                explanation,
                 transcript_snippet: d.transcript_snippet.clone(),
             }
         })
@@ -752,9 +830,7 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
 
 /// Stop the transcription pipeline (audio capture + Deepgram).
 #[tauri::command]
-pub fn stop_transcription(
-    state: State<'_, Mutex<AppState>>,
-) -> Result<(), String> {
+pub fn stop_transcription(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     let app_state = state.lock().map_err(|e| e.to_string())?;
 
     if !app_state.stt_active.load(Ordering::Relaxed) {

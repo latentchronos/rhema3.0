@@ -12,8 +12,16 @@ export interface RenderOptions {
   opacity?: number
   offsetX?: number
   offsetY?: number
-  scale?: number               // Scale factor for rendering at display size (e.g., 0.42 for 400px panel)
+  scale?: number // Scale factor for rendering at display size (e.g., 0.42 for 400px panel)
   imageCache?: Map<string, HTMLImageElement>
+}
+
+export interface ObsOverlayStatus {
+  active: boolean
+  port: number | null
+  mainUrl: string | null
+  altUrl: string | null
+  clientCount: number
 }
 
 export type TextHorizontalAlign = "left" | "center" | "right" | "justify"

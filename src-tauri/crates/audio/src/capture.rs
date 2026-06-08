@@ -24,11 +24,9 @@ impl AudioCapture {
 /// through the provided crossbeam sender.
 ///
 /// Audio is converted to mono 16-bit PCM at 16 kHz, with the specified gain
-/// applied.
-pub fn start(
-    config: AudioConfig,
-    sender: Sender<AudioFrame>,
-) -> Result<AudioCapture, AudioError> {
+/// applied. If a channel index is provided, only that source channel is used;
+/// otherwise all input channels are mixed down to mono.
+pub fn start(config: AudioConfig, sender: Sender<AudioFrame>) -> Result<AudioCapture, AudioError> {
     let host = cpal::default_host();
 
     // Select the device
@@ -37,9 +35,9 @@ pub fn start(
     let device = match &config.device_id {
         Some(id) if !id.is_empty() => {
             let mut found = None;
-            let input_devices = host
-                .input_devices()
-                .map_err(|e| AudioError::StreamError(format!("Failed to enumerate devices: {e}")))?;
+            let input_devices = host.input_devices().map_err(|e| {
+                AudioError::StreamError(format!("Failed to enumerate devices: {e}"))
+            })?;
             for d in input_devices {
                 if let Ok(name) = d.name() {
                     log::info!("[AUDIO]   Available device: '{}'", name);
@@ -56,7 +54,10 @@ pub fn start(
                     d
                 }
                 None => {
-                    log::warn!("[AUDIO] Device '{}' not found! Falling back to default.", id);
+                    log::warn!(
+                        "[AUDIO] Device '{}' not found! Falling back to default.",
+                        id
+                    );
                     host.default_input_device()
                         .ok_or(AudioError::NoInputDevices)?
                 }
@@ -66,7 +67,10 @@ pub fn start(
             let d = host
                 .default_input_device()
                 .ok_or(AudioError::NoInputDevices)?;
-            log::info!("[AUDIO] Using default device: '{}'", d.name().unwrap_or_default());
+            log::info!(
+                "[AUDIO] Using default device: '{}'",
+                d.name().unwrap_or_default()
+            );
             d
         }
     };
@@ -81,6 +85,9 @@ pub fn start(
 
     let target_sample_rate: u32 = 16_000;
     let gain = config.gain;
+    let channel_index = config
+        .channel_index
+        .and_then(|idx| (idx as usize).lt(&source_channels).then_some(idx as usize));
 
     let stream_config: StreamConfig = supported_config.into();
 
@@ -100,6 +107,7 @@ pub fn start(
                         source_sample_rate,
                         target_sample_rate,
                         gain,
+                        channel_index,
                         &sender,
                     );
                 },
@@ -126,6 +134,7 @@ pub fn start(
                         source_sample_rate,
                         target_sample_rate,
                         gain,
+                        channel_index,
                         &sender,
                     );
                 },
@@ -139,16 +148,15 @@ pub fn start(
                 &stream_config,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     // Convert u16 -> i16 (u16 midpoint is 32768)
-                    let i16_data: Vec<i16> = data
-                        .iter()
-                        .map(|&s| (s as i32 - 32768) as i16)
-                        .collect();
+                    let i16_data: Vec<i16> =
+                        data.iter().map(|&s| (s as i32 - 32768) as i16).collect();
                     process_and_send(
                         &i16_data,
                         source_channels,
                         source_sample_rate,
                         target_sample_rate,
                         gain,
+                        channel_index,
                         &sender,
                     );
                 },
@@ -178,20 +186,15 @@ fn process_and_send(
     source_rate: u32,
     target_rate: u32,
     gain: f32,
+    channel_index: Option<usize>,
     sender: &Sender<AudioFrame>,
 ) {
-    if samples.is_empty() {
+    if samples.is_empty() || source_channels == 0 {
         return;
     }
 
-    // Step 1: Downmix to mono by averaging channels
-    let mono: Vec<i16> = samples
-        .chunks(source_channels)
-        .map(|frame| {
-            let sum: i32 = frame.iter().map(|&s| s as i32).sum();
-            (sum / source_channels as i32) as i16
-        })
-        .collect();
+    // Step 1: Select a single channel or downmix to mono by averaging channels.
+    let mono = mix_to_mono(samples, source_channels, channel_index);
 
     // Step 2: Apply gain
     let gained: Vec<i16> = mono
@@ -250,4 +253,35 @@ fn resample(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     }
 
     output
+}
+
+fn mix_to_mono(samples: &[i16], source_channels: usize, channel_index: Option<usize>) -> Vec<i16> {
+    samples
+        .chunks(source_channels)
+        .map(|frame| {
+            if let Some(idx) = channel_index {
+                return frame.get(idx).copied().unwrap_or_default();
+            }
+
+            let sum: i32 = frame.iter().map(|&s| s as i32).sum();
+            (sum / frame.len().max(1) as i32) as i16
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mix_to_mono;
+
+    #[test]
+    fn mixes_stereo_to_mono() {
+        let samples = vec![100, 300, -100, -300];
+        assert_eq!(mix_to_mono(&samples, 2, None), vec![200, -200]);
+    }
+
+    #[test]
+    fn selects_requested_channel() {
+        let samples = vec![100, 300, 500, -100, -300, -500];
+        assert_eq!(mix_to_mono(&samples, 3, Some(1)), vec![300, -300]);
+    }
 }

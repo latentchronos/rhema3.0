@@ -13,13 +13,14 @@ describe("broadcast store sync", () => {
     vi.resetModules()
   })
 
-  it("syncBroadcastOutput emits current theme and verse to broadcast window", async () => {
+  it("syncBroadcastOutput emits current theme and verse to both broadcast windows", async () => {
     const { useBroadcastStore } = await import("./broadcast-store")
     const theme = useBroadcastStore.getState().themes[0]
     useBroadcastStore.setState({
       activeThemeId: theme.id,
+      altActiveThemeId: theme.id,
       liveVerse: {
-      reference: "John 3:16",
+        reference: "John 3:16",
         segments: [{ text: "For God so loved the world", verseNumber: 16 }],
       },
     })
@@ -27,14 +28,22 @@ describe("broadcast store sync", () => {
     emitToMock.mockClear()
     useBroadcastStore.getState().syncBroadcastOutput()
 
-    expect(emitToMock).toHaveBeenCalledTimes(1)
+    expect(emitToMock).toHaveBeenCalledTimes(2)
     expect(emitToMock).toHaveBeenCalledWith(
       "broadcast",
       "broadcast:verse-update",
       expect.objectContaining({
         theme: expect.objectContaining({ id: theme.id }),
         verse: expect.objectContaining({ reference: "John 3:16" }),
-      }),
+      })
+    )
+    expect(emitToMock).toHaveBeenCalledWith(
+      "broadcast-alt",
+      "broadcast:verse-update",
+      expect.objectContaining({
+        theme: expect.objectContaining({ id: theme.id }),
+        verse: expect.objectContaining({ reference: "John 3:16" }),
+      })
     )
   })
 })

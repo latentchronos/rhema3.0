@@ -6,7 +6,9 @@ interface SettingsState {
   claudeApiKey: string | null
   activeTranslationId: number
   audioDeviceId: string | null
+  audioChannelIndex: number | null
   gain: number
+  vadEnabled: boolean
   autoMode: boolean
   confidenceThreshold: number
   cooldownMs: number
@@ -17,7 +19,9 @@ interface SettingsState {
   setClaudeApiKey: (key: string | null) => void
   setActiveTranslationId: (id: number) => void
   setAudioDeviceId: (id: string | null) => void
+  setAudioChannelIndex: (id: number | null) => void
   setGain: (gain: number) => void
+  setVadEnabled: (enabled: boolean) => void
   setAutoMode: (auto: boolean) => void
   setConfidenceThreshold: (threshold: number) => void
   setCooldownMs: (ms: number) => void
@@ -30,7 +34,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   claudeApiKey: null,
   activeTranslationId: 1,
   audioDeviceId: null,
+  audioChannelIndex: null,
   gain: 1.0,
+  vadEnabled: false,
   autoMode: false,
   confidenceThreshold: 0.8,
   cooldownMs: 2500,
@@ -41,7 +47,9 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setClaudeApiKey: (claudeApiKey) => set({ claudeApiKey }),
   setActiveTranslationId: (activeTranslationId) => set({ activeTranslationId }),
   setAudioDeviceId: (audioDeviceId) => set({ audioDeviceId }),
+  setAudioChannelIndex: (audioChannelIndex) => set({ audioChannelIndex }),
   setGain: (gain) => set({ gain }),
+  setVadEnabled: (vadEnabled) => set({ vadEnabled }),
   setAutoMode: (autoMode) => set({ autoMode }),
   setConfidenceThreshold: (confidenceThreshold) => set({ confidenceThreshold }),
   setCooldownMs: (cooldownMs) => set({ cooldownMs }),
