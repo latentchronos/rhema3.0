@@ -4,7 +4,17 @@ pub mod device;
 pub mod meter;
 pub mod capture;
 pub mod vad;
+pub mod flux_gate;
+pub mod variance_gate;
+pub mod agc;
+pub mod feedback;
+pub mod gate_chain;
 
 pub use types::*;
 pub use error::*;
 pub use vad::{Vad, VadConfig, VadState, VadTransition};
+pub use flux_gate::{FluxResult, SubbandFluxConfig, SubbandFluxGate};
+pub use variance_gate::{EnergyVarianceGate, VarianceConfig, VarianceResult};
+pub use agc::{AgcConfig, RmsAgc};
+pub use feedback::{FeedbackConfig, FeedbackDetector, FeedbackResult};
+pub use gate_chain::{GateChain, GateChainConfig, GateOutcome};

@@ -8,7 +8,9 @@ use crate::events::{
     EVENT_TRANSCRIPT_PARTIAL,
 };
 use crate::state::AppState;
-use rhema_audio::{AudioConfig, AudioFrame, Vad, VadConfig, VadTransition};
+use rhema_audio::{
+    AudioConfig, AudioFrame, GateChain, GateChainConfig, Vad, VadConfig, VadTransition,
+};
 use rhema_stt::{DeepgramClient, SttConfig, TranscriptEvent};
 
 /// Start the full audio-capture-to-transcription pipeline.
@@ -108,6 +110,8 @@ pub async fn start_transcription(
 
             let mut frame_count: u64 = 0;
             let mut vad = use_vad.then(|| Vad::new(VadConfig::default()));
+            // Phase 1 hardware gating runs always, independent of the VAD toggle.
+            let mut gate_chain = GateChain::new(GateChainConfig::default());
 
             loop {
                 if !fan_active.load(Ordering::SeqCst) {
@@ -131,7 +135,29 @@ pub async fn start_transcription(
                             );
                         }
 
-                        // (b) Forward audio to Deepgram, optionally gated by local VAD.
+                        // (b) Hardware gate chain: re-block to 320-sample windows →
+                        //     flux → variance (drop bleed) → AGC (level) → feedback
+                        //     (zero-but-forward). The meter above read the PRE-AGC input.
+                        let gated = gate_chain.process(&frame.samples);
+                        if gated.windows_suppressed > 0 || gated.feedback_active {
+                            log::info!(
+                                "audio_gate: flagged {}/{} windows (peak_flux={:.3} peak_var={:.4}) feedback={} (observe mode: audio still forwarded)",
+                                gated.windows_suppressed,
+                                gated.windows_total,
+                                gated.peak_flux,
+                                gated.peak_variance,
+                                gated.feedback_active
+                            );
+                        }
+                        if gated.samples.is_empty() {
+                            continue;
+                        }
+                        let frame = AudioFrame {
+                            samples: gated.samples,
+                            timestamp_ms: frame.timestamp_ms,
+                        };
+
+                        // (c) Forward audio to Deepgram, optionally gated by local VAD.
                         if let Some(vad) = vad.as_mut() {
                             let result = vad.process(&frame);
                             match result.transition {
