@@ -38,9 +38,12 @@ const BAND_CENTERS_HZ: [f32; 6] = [250.0, 500.0, 1000.0, 2000.0, 4000.0, 6000.0]
 const DEFAULT_BAND_Q: f32 = 1.0;
 
 /// Default normalized-flux threshold above which a frame is judged "musical".
-/// Flux is in `0.0..≈1.0` (fraction of spectral mass that shifted bands), so
-/// `0.5` means roughly half the spectral energy abruptly changed bands.
-const DEFAULT_FLUX_THRESHOLD: f32 = 0.5;
+/// Flux is in `0.0..≈1.0` (fraction of spectral mass that shifted bands).
+/// Tuned against real audio (2026-06-12): speech flux peaked near 0.43, so 0.6
+/// leaves a safety margin. Note sustained instrumental music has *low* flux, so
+/// this gate mainly catches sharp broadband onsets, not steady music — the
+/// variance gate is the primary music discriminator.
+const DEFAULT_FLUX_THRESHOLD: f32 = 0.6;
 
 /// Total band energy below which the frame is treated as silence: there is no
 /// spectral onset to measure, so flux is reported as `0.0` and the flux
@@ -301,7 +304,12 @@ mod tests {
 
     #[test]
     fn abrupt_spectral_shift_is_gated() {
-        let mut g = gate();
+        // Explicit 0.5 threshold so this gating test is decoupled from the
+        // tuned default.
+        let mut g = SubbandFluxGate::new(SubbandFluxConfig {
+            flux_threshold: 0.5,
+            ..Default::default()
+        });
         // Establish a low-band (250 Hz) spectral shape.
         g.process(&sine(250.0, 16_000.0, 1024));
         g.process(&sine(250.0, 16_000.0, 1024));

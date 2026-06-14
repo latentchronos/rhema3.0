@@ -1,6 +1,7 @@
 use std::sync::Mutex;
 use tauri::State;
 
+use crate::epoch::EpochLock;
 use crate::state::AppState;
 use rhema_detection::{MergedDetection, ReadingMode};
 use serde::Serialize;
@@ -159,6 +160,17 @@ pub fn live_detection_metadata(
         decision.to_string(),
         explanation,
     )
+}
+
+/// Register an operator manual action (Phase 3, Bullet 3.2): bump the epoch
+/// lock so in-flight voice detections are discarded for the lock window.
+///
+/// The frontend should call this whenever the operator manually picks,
+/// projects, or navigates a verse, so the operator's choice wins over a voice
+/// detection that arrives a few hundred ms later. Returns the new epoch.
+#[tauri::command]
+pub fn acquire_operator_lock(epoch: State<'_, EpochLock>) -> u64 {
+    epoch.acquire()
 }
 
 /// Run the detection pipeline on a piece of transcript text

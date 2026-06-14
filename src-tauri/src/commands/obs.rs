@@ -51,6 +51,12 @@ impl Default for ObsOverlayServer {
 }
 
 impl ObsOverlayServer {
+    /// Whether the overlay HTTP/SSE server is currently running (Bullet 4.4
+    /// device-health probe).
+    pub fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
+
     fn status(&self) -> ObsOverlayStatus {
         let client_count = self.clients.lock().map(|c| c.len()).unwrap_or_default();
         ObsOverlayStatus {

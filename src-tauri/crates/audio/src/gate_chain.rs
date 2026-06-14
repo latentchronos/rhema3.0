@@ -228,8 +228,8 @@ mod tests {
     #[test]
     fn loud_dynamic_signal_is_suppressed_when_active() {
         let mut c = active_chain();
-        // Loud tone → high variance → dropped at the flux/variance stage.
-        let out = c.process(&tone(1000.0, 0.5, 320 * 3));
+        // Full-scale tone → variance ≈ 0.5 (> the 0.45 default) → dropped.
+        let out = c.process(&tone(1000.0, 1.0, 320 * 3));
         assert!(out.windows_suppressed > 0);
         assert!(out.samples.is_empty());
     }
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn observe_mode_counts_but_forwards() {
         let mut c = chain(); // default = observe
-        let out = c.process(&tone(1000.0, 0.5, 320 * 3));
+        let out = c.process(&tone(1000.0, 1.0, 320 * 3));
         // Flagged as bleed, but forwarded rather than dropped (speech-safe default).
         assert!(out.windows_suppressed > 0);
         assert!(!out.samples.is_empty());

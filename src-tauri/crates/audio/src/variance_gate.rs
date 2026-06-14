@@ -28,10 +28,12 @@ const VARIANCE_WINDOW_SAMPLES: usize = 320;
 /// Default variance value (normalized power units, `0.0..≈1.0`) at/above which a
 /// window is judged "dynamic" and the frame is gated.
 ///
-/// Placeholder default — the precise crossover between loud speech and musical
-/// bleed must be tuned against real captured audio (see the Phase 1 real-audio
-/// validation caveat). It is intentionally configurable via [`VarianceConfig`].
-const DEFAULT_VARIANCE_THRESHOLD: f32 = 0.01;
+/// Tuned against real captured audio (2026-06-12): speech `peak_var` topped out
+/// near 0.31 while sustained instrumental music ran 0.5–0.89, so 0.45 separates
+/// them with margin for loud speech. NOTE this discriminates by signal *power*,
+/// so it relies on worship music being louder than speech at the input; if a
+/// deployment has them at similar levels, retune via [`VarianceConfig`].
+const DEFAULT_VARIANCE_THRESHOLD: f32 = 0.45;
 
 /// Scale factor to map `i16` PCM into the `-1.0..=1.0` float domain.
 const I16_SCALE: f64 = 32_768.0;
@@ -145,6 +147,14 @@ mod tests {
         EnergyVarianceGate::new(VarianceConfig::default())
     }
 
+    /// Gate with an explicit threshold, so gating-mechanism tests are decoupled
+    /// from the tuned default.
+    fn gate_with(threshold: f32) -> EnergyVarianceGate {
+        EnergyVarianceGate::new(VarianceConfig {
+            variance_threshold: threshold,
+        })
+    }
+
     #[test]
     fn silence_has_zero_variance_and_passes() {
         let r = gate().process(&vec![0i16; 320]);
@@ -163,7 +173,7 @@ mod tests {
     fn loud_dynamic_tone_is_gated() {
         // 1 kHz at 16 kHz over 320 samples = 20 whole cycles → mean ≈ 0,
         // so variance ≈ A²/2 = 0.5²/2 = 0.125.
-        let r = gate().process(&sine(1000.0, 0.5, 16_000.0, 320));
+        let r = gate_with(0.01).process(&sine(1000.0, 0.5, 16_000.0, 320));
         assert!(r.variance > 0.10, "variance lower than expected: {}", r.variance);
         assert!(r.gated);
     }
@@ -195,7 +205,7 @@ mod tests {
     #[test]
     fn multi_window_frame_uses_worst_window() {
         // 1024 samples = three full 320-windows (+64 ignored). A loud frame gates.
-        let r = gate().process(&sine(1000.0, 0.5, 16_000.0, 1024));
+        let r = gate_with(0.01).process(&sine(1000.0, 0.5, 16_000.0, 1024));
         assert!(r.gated);
     }
 }

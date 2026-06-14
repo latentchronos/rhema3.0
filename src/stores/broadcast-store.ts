@@ -1,7 +1,15 @@
 import { create } from "zustand"
 import { emitTo } from "@tauri-apps/api/event"
 import { invoke } from "@tauri-apps/api/core"
-import type { BroadcastTheme, VerseRenderData } from "@/types"
+import type {
+  AudienceChannelState,
+  BroadcastTheme,
+  DeviceStatus,
+  OperatorChannelState,
+  PastorChannelState,
+  RoutingMode,
+  VerseRenderData,
+} from "@/types"
 import { BUILTIN_THEMES } from "@/lib/builtin-themes"
 
 type SelectedElement = "verse" | "reference" | null
@@ -12,6 +20,15 @@ interface BroadcastState {
   altActiveThemeId: string
   isLive: boolean
   liveVerse: VerseRenderData | null
+
+  // --- Phase 4 channel model (ADDITIVE — caches of backend channel truth).
+  // The channel fields below are populated ONLY by Tauri event listeners
+  // (see hooks/use-channels.ts); never mutate them directly from components.
+  routingMode: RoutingMode
+  audienceChannel: AudienceChannelState | null
+  pastorChannel: PastorChannelState | null
+  operatorChannel: OperatorChannelState | null
+  deviceHealth: DeviceStatus[]
 
   // Designer state
   isDesignerOpen: boolean
@@ -30,6 +47,12 @@ interface BroadcastState {
   setLiveVerse: (verse: VerseRenderData | null) => void
   syncBroadcastOutput: () => void
   syncBroadcastOutputFor: (outputId: string) => void
+
+  // Phase 4 channel actions
+  setRoutingMode: (mode: RoutingMode) => void
+  setAudienceChannel: (channel: AudienceChannelState) => void
+  setPastorChannel: (channel: PastorChannelState) => void
+  setOperatorChannel: (channel: OperatorChannelState) => void
 
   // Designer actions
   setDesignerOpen: (open: boolean) => void
@@ -89,6 +112,11 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
   altActiveThemeId: BUILTIN_THEMES[0].id,
   isLive: false,
   liveVerse: null,
+  routingMode: "locked",
+  audienceChannel: null,
+  pastorChannel: null,
+  operatorChannel: null,
+  deviceHealth: [],
   isDesignerOpen: false,
   editingThemeId: null,
   draftTheme: null,
@@ -156,6 +184,24 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
     set({ liveVerse })
     get().syncBroadcastOutput()
   },
+
+  // Phase 4 — operator selects the routing mode. Optimistically set locally and
+  // tell the backend, which re-publishes the pastor/operator channels.
+  setRoutingMode: (routingMode) => {
+    set({ routingMode })
+    void invoke("set_routing_mode", { mode: routingMode }).catch(() => {})
+  },
+  // Phase 4 — channel caches. Called ONLY by the Tauri event listeners.
+  setAudienceChannel: (audienceChannel) => set({ audienceChannel }),
+  setPastorChannel: (pastorChannel) => set({ pastorChannel }),
+  setOperatorChannel: (operatorChannel) =>
+    set({
+      operatorChannel,
+      // Mirror the authoritative routing mode the backend reports.
+      routingMode: operatorChannel.routing_state,
+      // Device health is delivered inside the operator channel (Bullet 4.4).
+      deviceHealth: operatorChannel.device_health,
+    }),
 
   // Designer
   setDesignerOpen: (isDesignerOpen) => {

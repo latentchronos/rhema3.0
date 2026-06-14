@@ -1,6 +1,9 @@
+mod channels;
 mod commands;
+mod epoch;
 mod events;
 mod state;
+mod suppression;
 
 use std::sync::Mutex;
 
@@ -18,11 +21,13 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(Mutex::new(state::AppState::new()))
+        .manage(epoch::EpochLock::default())
         .manage(Mutex::new(rhema_broadcast::ndi::NdiRuntime::default()))
         .manage(Mutex::new(rhema_detection::DirectDetector::new()))
         .manage(Mutex::new(rhema_detection::DetectionMerger::new()))
         .manage(Mutex::new(rhema_detection::ReadingMode::new()))
         .manage(Mutex::new(commands::obs::ObsOverlayServer::default()))
+        .manage(Mutex::new(channels::ChannelState::default()))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -34,6 +39,7 @@ pub fn run() {
             commands::bible::get_active_translation,
             commands::bible::set_active_translation,
             commands::detection::detect_verses,
+            commands::detection::acquire_operator_lock,
             commands::detection::detection_status,
             commands::detection::semantic_search,
             commands::detection::toggle_paraphrase_detection,
@@ -55,9 +61,32 @@ pub fn run() {
             commands::obs::stop_obs_overlay,
             commands::obs::get_obs_overlay_status,
             commands::obs::push_obs_overlay,
+            channels::set_routing_mode,
+            channels::commit_live_verse,
         ])
         .setup(|app| {
             use tauri::Manager;
+
+            // Phase 2: drain the Stage-2 (LLM fallback) channel. The detection
+            // pipeline queues ambiguous transcripts; this placeholder logs them.
+            // Phase 5 replaces the placeholder with the real Claude API call.
+            {
+                let stage2_rx = app
+                    .state::<Mutex<state::AppState>>()
+                    .lock()
+                    .unwrap()
+                    .detection_pipeline
+                    .take_stage2_receiver();
+                if let Some(rx) = stage2_rx {
+                    tauri::async_runtime::spawn(rhema_detection::run_stage2_placeholder(rx));
+                }
+            }
+
+            // Phase 4 (Bullet 4.4): start the 2s device-health monitor. It
+            // probes each output endpoint, updates the operator channel's
+            // device_health on change, and resyncs the audience channel on
+            // reconnect. Channel content state is never reset by a device drop.
+            channels::spawn_device_health_monitor(app.handle().clone());
 
             // Try resource dir first (production), then dev fallback
             let db_path = app

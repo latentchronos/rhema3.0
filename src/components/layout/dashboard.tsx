@@ -5,8 +5,12 @@ import { LiveOutputPanel } from "@/components/panels/live-output-panel"
 import { QueuePanel } from "@/components/panels/queue-panel"
 import { SearchPanel } from "@/components/panels/search-panel"
 import { DetectionsPanel } from "@/components/panels/detections-panel"
+import { useChannels } from "@/hooks/use-channels"
 
 export function Dashboard() {
+  // Subscribe to the Phase 4 channel events and cache them in the broadcast store.
+  useChannels()
+
   return (
     <div
       style={{

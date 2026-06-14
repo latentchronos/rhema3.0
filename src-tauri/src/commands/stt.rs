@@ -7,6 +7,7 @@ use crate::events::{
     AudioLevelPayload, TranscriptPayload, EVENT_AUDIO_LEVEL, EVENT_TRANSCRIPT_FINAL,
     EVENT_TRANSCRIPT_PARTIAL,
 };
+use crate::epoch::EpochLock;
 use crate::state::AppState;
 use rhema_audio::{
     AudioConfig, AudioFrame, GateChain, GateChainConfig, Vad, VadConfig, VadTransition,
@@ -111,6 +112,10 @@ pub async fn start_transcription(
             let mut frame_count: u64 = 0;
             let mut vad = use_vad.then(|| Vad::new(VadConfig::default()));
             // Phase 1 hardware gating runs always, independent of the VAD toggle.
+            // Kept SPEECH-SAFE (observe mode: gates measure + log but never drop)
+            // until the level-invariant discriminator + per-venue calibration land
+            // (see the gate-polish backlog). Prime directive: never drop the sermon.
+            // AGC leveling and feedback detection still apply.
             let mut gate_chain = GateChain::new(GateChainConfig::default());
 
             loop {
@@ -141,7 +146,7 @@ pub async fn start_transcription(
                         let gated = gate_chain.process(&frame.samples);
                         if gated.windows_suppressed > 0 || gated.feedback_active {
                             log::info!(
-                                "audio_gate: flagged {}/{} windows (peak_flux={:.3} peak_var={:.4}) feedback={} (observe mode: audio still forwarded)",
+                                "audio_gate: flagged {}/{} windows (peak_flux={:.3} peak_var={:.4}) feedback={} (observe: audio forwarded)",
                                 gated.windows_suppressed,
                                 gated.windows_total,
                                 gated.peak_flux,
@@ -157,10 +162,17 @@ pub async fn start_transcription(
                             timestamp_ms: frame.timestamp_ms,
                         };
 
-                        // (c) Forward audio to Deepgram, optionally gated by local VAD.
+                        // (c) Forward audio to Deepgram. The local VAD is used
+                        //     ONLY for the UI speech-indicator events — it does
+                        //     NOT gate the audio stream. Deepgram does its own
+                        //     server-side VAD/endpointing (vad_events/endpointing
+                        //     in the connection URL), so gating locally before it
+                        //     is redundant and could starve the transcriber of
+                        //     speech (e.g. when the gate's AGC under-boosts quiet
+                        //     onsets). Always forwarding keeps transcription
+                        //     reliable while preserving the speech indicators.
                         if let Some(vad) = vad.as_mut() {
-                            let result = vad.process(&frame);
-                            match result.transition {
+                            match vad.process(&frame).transition {
                                 Some(VadTransition::SpeechStarted) => {
                                     let _ = fan_app.emit("stt_speech_started", ());
                                 }
@@ -169,13 +181,8 @@ pub async fn start_transcription(
                                 }
                                 None => {}
                             }
-
-                            for vad_frame in result.frames {
-                                let _ = deepgram_tx.try_send(vad_frame.samples);
-                            }
-                        } else {
-                            let _ = deepgram_tx.try_send(frame.samples);
                         }
+                        let _ = deepgram_tx.try_send(frame.samples);
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -422,8 +429,54 @@ pub async fn start_transcription(
 /// Uses SEPARATE Mutex<DirectDetector> and Mutex<DetectionMerger> so it
 /// never blocks on the semantic worker, and cooldown state persists across calls.
 /// Returns true if high-confidence results were found (>= 0.90).
+/// Single egress point for `verse_detections` events (Gap C).
+///
+/// Runs the suppression cache (Gap B) — dropping verses that echo a
+/// recently-displayed one — then emits the survivors. Source `"contextual"`
+/// (reading mode) is exempt from suppression. Fails open: if `AppState` is
+/// momentarily locked (e.g. by the semantic worker), results are emitted
+/// unfiltered rather than blocking the detection path.
+fn emit_detections(
+    app: &AppHandle,
+    source: &str,
+    results: Vec<super::detection::DetectionResult>,
+    epoch_at_detection: u64,
+) {
+    if results.is_empty() {
+        return;
+    }
+    // Epoch lock (Bullet 3.2): operator manual actions win. Discard detections
+    // whose epoch is stale or that arrive inside the operator lock window.
+    if app.state::<EpochLock>().is_locked_out(epoch_at_detection) {
+        log::info!(
+            "epoch_lock: discarded {} {} detection(s) (epoch_at_detection={})",
+            results.len(),
+            source,
+            epoch_at_detection
+        );
+        return;
+    }
+    let managed: State<'_, Mutex<AppState>> = app.state();
+    // Bind to a local (not a block tail) so the guard/Result temporary drop at
+    // this statement's `;` — the lock is released before we emit.
+    let kept = match managed.try_lock() {
+        Ok(mut state) => state.suppression_cache.filter(source, results),
+        Err(_) => results,
+    };
+    if kept.is_empty() {
+        return;
+    }
+    let _ = app.emit("verse_detections", &kept);
+    // Phase 4 (Bullet 4.2): also route the surviving detections to the Operator
+    // channel (confidence + raw detections are operator-only). Additive — the
+    // verse_detections event above is retained for existing consumers.
+    crate::channels::route_detections(app, &kept);
+}
+
 fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
     use rhema_detection::{DetectionMerger, DirectDetector};
+
+    let epoch_at_detection = app.state::<EpochLock>().current();
 
     let detector_state: State<'_, Mutex<DirectDetector>> = app.state();
     let mut detector = match detector_state.lock() {
@@ -495,7 +548,7 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
                     r.confidence * 100.0
                 );
             }
-            let _ = app.emit("verse_detections", &results);
+            emit_detections(app, "direct", results, epoch_at_detection);
             return has_high_confidence;
         }
     };
@@ -519,12 +572,13 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
         );
     }
     drop(app_state);
-    let _ = app.emit("verse_detections", &results);
+    emit_detections(app, "direct", results, epoch_at_detection);
     has_high_confidence
 }
 
 /// Run semantic (ONNX embedding) detection. Slow, runs in background worker.
 fn run_semantic_detection(app: &AppHandle, transcript: &str) {
+    let epoch_at_detection = app.state::<EpochLock>().current();
     log::info!(
         "[DET-SEMANTIC] Running on: {:?}",
         &transcript[..transcript.len().min(80)]
@@ -577,13 +631,15 @@ fn run_semantic_detection(app: &AppHandle, transcript: &str) {
         );
     }
     drop(app_state);
-    let _ = app.emit("verse_detections", &results);
+    emit_detections(app, "semantic", results, epoch_at_detection);
 }
 
 /// Check reading mode: if active, test transcript against expected verse.
 /// If direct detection just found a new verse, start/restart reading mode.
 fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
     use rhema_detection::ReadingMode;
+
+    let epoch_at_detection = app.state::<EpochLock>().current();
 
     // If direct detection found a verse, consider starting/restarting reading mode.
     // BUT: if reading mode is already active on a book/chapter, do NOT restart
@@ -719,7 +775,7 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
             explanation,
             transcript_snippet: String::new(),
         };
-        let _ = app.emit("verse_detections", &vec![result]);
+        emit_detections(app, "contextual", vec![result], epoch_at_detection);
     }
 }
 
@@ -769,6 +825,7 @@ fn check_translation_command(app: &AppHandle, transcript: &str) {
 
 /// Run quotation matching against all loaded Bible translations.
 fn run_quotation_matching(app: &AppHandle, transcript: &str) {
+    let epoch_at_detection = app.state::<EpochLock>().current();
     // When reading mode is active, suppress quotation matching entirely.
     // The reader is actively reading a passage — quotation matches for
     // OTHER books would hijack the display away from what's being read.
@@ -851,7 +908,7 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
     }
 
     drop(app_state);
-    let _ = app.emit("verse_detections", &results);
+    emit_detections(app, "quotation", results, epoch_at_detection);
 }
 
 /// Stop the transcription pipeline (audio capture + Deepgram).

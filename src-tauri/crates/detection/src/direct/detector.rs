@@ -157,6 +157,73 @@ fn clean_transcript(text: &str) -> String {
     collapsed.trim().to_string()
 }
 
+/// Interjections a congregation shouts mid-sentence ("Amen!", "Hallelujah!")
+/// that never form part of a verse coordinate. Stripped before parsing so a
+/// reference interrupted by one still resolves (e.g. "Romans Amen eight one").
+const INTERJECTIONS: &[&str] = &[
+    "amen",
+    "hallelujah",
+    "glory",
+    "praise",
+    "yes",
+    "wow",
+    "oh",
+];
+
+/// Token-skip pre-parse: remove interjection tokens from `text`, returning the
+/// cleaned text and the list of skipped tokens (in their original form).
+///
+/// This realises the Phase 2 "token-skip lookahead" — the skip-candidates are
+/// exactly [`INTERJECTIONS`], and since such tokens never contribute to a verse
+/// coordinate (and the automaton finds book names at any offset), removing them
+/// reconnects a book with its chapter/verse across the interruption. Comparison
+/// is case-insensitive and ignores surrounding punctuation, so "Amen!" matches.
+fn skip_interjections(text: &str) -> (String, Vec<String>) {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    for token in text.split_whitespace() {
+        let core = token
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_ascii_lowercase();
+        if INTERJECTIONS.contains(&core.as_str()) {
+            skipped.push(token.to_string());
+        } else {
+            kept.push(token);
+        }
+    }
+    (kept.join(" "), skipped)
+}
+
+/// Negation / self-correction markers. When the speaker says one of these, any
+/// reference spoken before it was retracted (Phase 3, Bullet 3.3).
+const NEGATION_MARKERS: &[&str] = &[
+    "no wait",
+    "scratch that",
+    "never mind",
+    "i mean",
+    "correction",
+    "actually",
+    "sorry",
+    "wait",
+];
+
+/// Byte offset just past the LAST negation marker in `text` (case-insensitive),
+/// or `None` if none is present. Positions are relative to `text` (ASCII
+/// transcripts), so they are comparable with `BookMatch::start`.
+fn last_negation_marker_end(text: &str) -> Option<usize> {
+    let lower = text.to_lowercase();
+    let mut last_end: Option<usize> = None;
+    for marker in NEGATION_MARKERS {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(marker) {
+            let end = from + rel + marker.len();
+            last_end = Some(last_end.map_or(end, |e| e.max(end)));
+            from += rel + 1;
+        }
+    }
+    last_end
+}
+
 /// How long to wait for an incomplete reference to be completed (5 seconds).
 const INCOMPLETE_REF_TIMEOUT_MS: u128 = 5000;
 
@@ -256,7 +323,11 @@ impl DirectDetector {
     pub fn detect(&mut self, text: &str) -> Vec<Detection> {
         // Step 0: Clean filler phrases from the transcript
         let cleaned = clean_transcript(text);
-        let text = &cleaned;
+        // Step 0a: Token-skip pre-parse — drop interjections ("Amen!", "Hallelujah")
+        // a congregation shouts mid-reference, so the book and its coordinates
+        // reconnect for the parser.
+        let (skip_cleaned, skipped_tokens) = skip_interjections(&cleaned);
+        let text = &skip_cleaned;
 
         let mut detections = Vec::new();
 
@@ -322,8 +393,29 @@ impl DirectDetector {
             &book_matches
         };
 
+        // Negation-marker filter (Bullet 3.3): if the speaker corrected
+        // themselves ("...no wait..."), drop references before the last marker
+        // and lock onto the terminal reference(s) after it — but only when a
+        // reference actually follows the marker, so a lone reference trailed by
+        // a benign "actually"/"wait" is not wrongly discarded.
+        let negation_cutoff = last_negation_marker_end(text);
+        let drop_before_negation = negation_cutoff
+            .map(|cut| effective_matches.iter().any(|m| m.start >= cut))
+            .unwrap_or(false);
+
         // Step 2 & 3: Parse references and resolve context
         for book_match in effective_matches {
+            if drop_before_negation {
+                if let Some(cut) = negation_cutoff {
+                    if book_match.start < cut {
+                        log::info!(
+                            "negation_filter: dropped retracted reference '{}' before marker",
+                            book_match.book_name
+                        );
+                        continue;
+                    }
+                }
+            }
             if let Some(verse_ref) = parser::parse_reference(text, book_match) {
                 // Resolve any partial references using context
                 let resolved = self.context.resolve(&verse_ref);
@@ -371,6 +463,14 @@ impl DirectDetector {
                 detections.push(detection);
                 self.context.update(&resolved);
             }
+        }
+
+        if !skipped_tokens.is_empty() && !detections.is_empty() {
+            log::info!(
+                "[DET-DIRECT] token_skip: skipped {:?} to resolve {} reference(s)",
+                skipped_tokens,
+                detections.len()
+            );
         }
 
         detections
@@ -547,6 +647,72 @@ fn extract_snippet(text: &str, start: usize, end: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_skip_strips_interjections() {
+        let (cleaned, skipped) = skip_interjections("Romans Amen eight one");
+        assert_eq!(cleaned, "Romans eight one");
+        assert_eq!(skipped, vec!["Amen".to_string()]);
+    }
+
+    #[test]
+    fn token_skip_handles_punctuation_and_case() {
+        let (cleaned, skipped) =
+            skip_interjections("praise the Lord Hallelujah! John three sixteen");
+        assert_eq!(cleaned, "the Lord John three sixteen");
+        assert_eq!(skipped, vec!["praise".to_string(), "Hallelujah!".to_string()]);
+    }
+
+    #[test]
+    fn token_skip_leaves_clean_text_untouched() {
+        let (cleaned, skipped) = skip_interjections("John three sixteen");
+        assert_eq!(cleaned, "John three sixteen");
+        assert!(skipped.is_empty());
+    }
+
+    #[test]
+    fn detect_resolves_reference_across_interjection() {
+        let mut detector = DirectDetector::new();
+        let results = detector.detect("Romans Amen eight one");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verse_ref.book_name, "Romans");
+        assert_eq!(results[0].verse_ref.chapter, 8);
+        assert_eq!(results[0].verse_ref.verse_start, 1);
+    }
+
+    #[test]
+    fn negation_keeps_only_terminal_reference() {
+        let mut d = DirectDetector::new();
+        let results = d.detect("John 3:16 no wait Romans 8:1");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verse_ref.book_name, "Romans");
+        assert_eq!(results[0].verse_ref.chapter, 8);
+        assert_eq!(results[0].verse_ref.verse_start, 1);
+    }
+
+    #[test]
+    fn negation_marker_without_following_reference_keeps_all() {
+        let mut d = DirectDetector::new();
+        // "actually" with no reference after it must NOT drop the lone reference.
+        let results = d.detect("John 3:16 actually");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].verse_ref.book_name, "John");
+    }
+
+    #[test]
+    fn no_negation_marker_keeps_all_references() {
+        let mut d = DirectDetector::new();
+        let results = d.detect("John 3:16 and Romans 8:1");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn last_negation_marker_end_finds_latest() {
+        assert!(last_negation_marker_end("John 3:16 powerful").is_none());
+        let text = "John 3 no wait Romans 8:1";
+        let end = last_negation_marker_end(text).unwrap();
+        assert!(end <= text.find("Romans").unwrap());
+    }
 
     #[test]
     fn test_basic_reference() {

@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button"
 import { SettingsDialog } from "@/components/settings-dialog"
 import { ThemeDesigner } from "@/components/broadcast/theme-designer"
 import { BroadcastSettings } from "@/components/broadcast/broadcast-settings"
+import { RoutingModeToggle } from "@/components/controls/routing-mode-toggle"
 import { useAudioStore, useTranscriptStore, useBroadcastStore } from "@/stores"
 
 export function TransportBar() {
@@ -35,6 +36,7 @@ export function TransportBar() {
 
       {/* Right: Audio + Status + Settings */}
       <div className="flex items-center gap-3">
+        <RoutingModeToggle />
         <div className="flex items-center gap-2">
           <MicIcon className="size-3.5 text-muted-foreground" />
           <LevelMeter level={audioLevel.rms} bars={4} />
