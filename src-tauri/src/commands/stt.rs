@@ -319,16 +319,79 @@ pub async fn start_transcription(
         }
     });
 
+    // Detection worker: runs ALL heavy detection (direct, translation, reading
+    // mode, quotation/semantic routing) off the transcript-event hot path. Fed
+    // by `try_send` (drop-if-busy), so the consumer never blocks; under a fast-
+    // speech interim flood, redundant partials are coalesced (dropped) rather
+    // than backpressuring the WebSocket reader and dropping the connection.
+    let (detection_tx, mut detection_rx) =
+        tokio::sync::mpsc::channel::<DetectionJob>(32);
+    let det_app = app.clone();
     tauri::async_runtime::spawn(async move {
         // Sentence buffer accumulates is_final fragments into complete sentences.
         // Flushes on sentence-ending punctuation or speech_final signal.
         let mut sentence_buf = rhema_detection::SentenceBuffer::new();
 
+        while let Some(job) = detection_rx.recv().await {
+            match job {
+                DetectionJob::Partial(transcript) => {
+                    // Direct detection on partials — makes detection feel instant
+                    // for verbose forms like "Psalm chapter 2 verse 3".
+                    run_direct_detection(&det_app, &transcript);
+                }
+                DetectionJob::Final {
+                    transcript,
+                    speech_final,
+                } => {
+                    if !transcript.is_empty() {
+                        // Translation commands: "read in NIV", "switch to ESV"
+                        check_translation_command(&det_app, &transcript);
+
+                        // Direct detection: instant (regex), runs on every is_final
+                        let direct_found = run_direct_detection(&det_app, &transcript);
+
+                        // Reading mode: check if transcript matches expected verse
+                        check_reading_mode(&det_app, &transcript, direct_found);
+
+                        // Only run quotation/semantic if direct didn't already find
+                        // high-confidence results (no point on ONNX-ing a verse
+                        // direct already detected at 100%).
+                        if !direct_found {
+                            let _ = quotation_tx.try_send(transcript.clone());
+                            if let Some(sentence) = sentence_buf.append(&transcript) {
+                                let _ = semantic_tx.try_send(sentence);
+                            }
+                        } else {
+                            sentence_buf.force_flush();
+                        }
+                    }
+
+                    // On speech_final: force-flush any remaining buffered text
+                    if speech_final {
+                        if let Some(sentence) = sentence_buf.force_flush() {
+                            let _ = semantic_tx.try_send(sentence);
+                        }
+                    }
+                }
+                DetectionJob::UtteranceEnd => {
+                    if let Some(sentence) = sentence_buf.force_flush() {
+                        let _ = semantic_tx.try_send(sentence);
+                    }
+                }
+            }
+        }
+        log::info!("Detection worker task exited");
+    });
+
+    tauri::async_runtime::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if !evt_active.load(Ordering::SeqCst) {
                 break;
             }
 
+            // Hot path: only emit transcript events and hand text to the
+            // detection worker. No heavy work here, so the bounded transcript
+            // channel drains fast and the WebSocket reader never backpressures.
             match event {
                 TranscriptEvent::Partial { transcript, .. } => {
                     if !transcript.is_empty() {
@@ -340,13 +403,7 @@ pub async fn start_transcription(
                                 confidence: 0.0,
                             },
                         );
-
-                        // Run direct detection on partials too — cheap regex
-                        // patterns make this feasible on every interim result.
-                        // This makes detection feel instant for verbose forms
-                        // like "Psalm chapter 2 verse 3" that take longer to
-                        // finalize than compact "Psalm 2:3".
-                        run_direct_detection(&event_app, &transcript);
+                        let _ = detection_tx.try_send(DetectionJob::Partial(transcript));
                     }
                 }
                 TranscriptEvent::Final {
@@ -365,47 +422,14 @@ pub async fn start_transcription(
                                 confidence,
                             },
                         );
-
-                        // Check for translation commands: "read in NIV", "switch to ESV"
-                        check_translation_command(&event_app, &transcript);
-
-                        // Direct detection: instant (regex), runs on every is_final
-                        let direct_found = run_direct_detection(&event_app, &transcript);
-
-                        // Reading mode: check if transcript matches expected verse
-                        check_reading_mode(&event_app, &transcript, direct_found);
-
-                        // Quotation matching: run on every is_final (fast, no ONNX)
-                        if !direct_found {
-                            let _ = quotation_tx.try_send(transcript.clone());
-                        }
-
-                        // Only accumulate for semantic if direct didn't find
-                        // high-confidence results. No point running ONNX inference
-                        // on "Revelation chapter two verse three" when direct
-                        // already detected it at 100%.
-                        if !direct_found {
-                            if let Some(sentence) = sentence_buf.append(&transcript) {
-                                let _ = semantic_tx.try_send(sentence);
-                            }
-                        } else {
-                            // Clear the sentence buffer — direct handled it
-                            sentence_buf.force_flush();
-                        }
                     }
-
-                    // On speech_final: force-flush any remaining buffered text
-                    if speech_final {
-                        if let Some(sentence) = sentence_buf.force_flush() {
-                            let _ = semantic_tx.try_send(sentence);
-                        }
-                    }
+                    let _ = detection_tx.try_send(DetectionJob::Final {
+                        transcript,
+                        speech_final,
+                    });
                 }
                 TranscriptEvent::UtteranceEnd => {
-                    // Fallback: flush sentence buffer on utterance end
-                    if let Some(sentence) = sentence_buf.force_flush() {
-                        let _ = semantic_tx.try_send(sentence);
-                    }
+                    let _ = detection_tx.try_send(DetectionJob::UtteranceEnd);
                 }
                 TranscriptEvent::SpeechStarted => {
                     let _ = event_app.emit("stt_speech_started", ());
@@ -477,6 +501,16 @@ fn emit_detections(
     // channel (confidence + raw detections are operator-only). Additive — the
     // verse_detections event above is retained for existing consumers.
     crate::channels::route_detections(app, &kept);
+}
+
+/// A unit of detection work, routed off the transcript-event hot path to a
+/// dedicated worker (fast-speech backpressure fix). Keeping the consumer loop
+/// O(cheap) lets it drain the bounded transcript-event channel instantly, so the
+/// Deepgram WebSocket reader never backpressures and drops the connection.
+enum DetectionJob {
+    Partial(String),
+    Final { transcript: String, speech_final: bool },
+    UtteranceEnd,
 }
 
 fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
