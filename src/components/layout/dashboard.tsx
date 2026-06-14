@@ -5,6 +5,7 @@ import { LiveOutputPanel } from "@/components/panels/live-output-panel"
 import { QueuePanel } from "@/components/panels/queue-panel"
 import { SearchPanel } from "@/components/panels/search-panel"
 import { DetectionsPanel } from "@/components/panels/detections-panel"
+import { SuggestionsPanel } from "@/components/panels/suggestions-panel"
 import { useChannels } from "@/hooks/use-channels"
 
 export function Dashboard() {
@@ -48,7 +49,12 @@ export function Dashboard() {
       {/* Row 3: Search + Detections (own grid, independent of top row columns) */}
       <div className="col-span-4 grid min-h-0 grid-cols-[2fr_1fr] gap-3 px-3 pb-3">
         <SearchPanel />
-        <DetectionsPanel />
+        <div className="flex min-h-0 flex-col gap-3">
+          <div className="min-h-0 flex-1">
+            <DetectionsPanel />
+          </div>
+          <SuggestionsPanel />
+        </div>
       </div>
     </div>
     // <div

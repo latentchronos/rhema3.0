@@ -175,11 +175,39 @@ fn is_control_command(text: &str) -> bool {
 }
 
 /// Stage-2 (LLM fallback) placeholder consumer. Logs each ambiguous transcript
-/// queued by the pipeline. Phase 5 replaces the body with the real Claude call;
-/// this exists now so the channel and its consumer are wired end-to-end.
+/// queued by the pipeline so the channel and its consumer are wired end-to-end.
+///
+/// # Phase 5, Bullet 5.4 — deliberately still a placeholder
+///
+/// The roadmap wires this to a real Claude call *iff* `rhema-api` is implemented.
+/// It is currently an empty stub crate, so per the bullet the placeholder is
+/// retained. Turning it into the real Stage-2 fallback requires, in order:
+///
+/// 1. **Implement `rhema-api`** as the Anthropic HTTP client. The project has no
+///    official Anthropic Rust SDK available, so this is raw HTTP via `reqwest`
+///    (`reqwest` is on the approved dependency list but is NOT yet a dependency
+///    of `rhema-api`/`rhema-detection`/`app` — adding it to `rhema-api` needs
+///    explicit approval, per the GEMINI dependency rule).
+/// 2. **Endpoint / headers:** `POST https://api.anthropic.com/v1/messages`,
+///    headers `x-api-key: <key>` and `anthropic-version: 2023-06-01`.
+///    Model `claude-opus-4-8`; adaptive thinking; structured-output JSON
+///    (`output_config.format`) returning `{intent, entities}`; latency budget
+///    200–500ms (ARCHITECTURE §4.3 Stage-2). The API key currently lives in the
+///    frontend `settings-store`; it must be surfaced to the backend (e.g. via
+///    `AppState`) for this call.
+/// 3. **Prompt:** the ambiguous utterance + current sermon context + cursor
+///    position, as described in ARCHITECTURE §4.3.
+/// 4. **Route the result** back through the existing detection/suggestion paths
+///    (which are already operator-gated — Operator channel, epoch lock,
+///    suppression); Stage-2 classifies only and never auto-projects.
+///
+/// Also note (carried from Phase 2): the LIVE stt path classifies via
+/// `Mutex<DirectDetector>` directly, so `classify()` → `route_stage2()` only runs
+/// through `DetectionPipeline::process`. Feeding the live flow into Stage-2 is a
+/// separate wiring step that must land alongside the real Claude call.
 pub async fn run_stage2_placeholder(mut rx: UnboundedReceiver<String>) {
     while let Some(transcript) = rx.recv().await {
-        log::info!("stage2_fallback: queued '{}'", transcript);
+        log::info!("stage2_fallback: queued '{}' (placeholder — see run_stage2_placeholder docs for real-Claude wiring)", transcript);
     }
 }
 

@@ -3,7 +3,9 @@ import { PanelHeader } from "@/components/ui/panel-header"
 import { CanvasVerse } from "@/components/ui/canvas-verse"
 import { cn } from "@/lib/utils"
 import { useBroadcastStore, useBibleStore } from "@/stores"
-import { deriveLiveVerse } from "@/hooks/use-broadcast"
+import { ChevronLeftIcon, ChevronRightIcon } from "lucide-react"
+import { commitLiveVerse, deriveLiveVerse, stepLiveVerse } from "@/hooks/use-broadcast"
+import { acquireOperatorLock } from "@/lib/operator-lock"
 
 export function LiveOutputPanel() {
   const isLive = useBroadcastStore((s) => s.isLive)
@@ -26,8 +28,10 @@ export function LiveOutputPanel() {
   })
 
   useEffect(() => {
-    useBroadcastStore.getState().setLiveVerse(verseData)
-  }, [verseData])
+    // Commit through the channel layer (also retains the legacy render path).
+    // Null when not live / no verse → blanks the audience channel.
+    commitLiveVerse(isLive ? selectedVerse : null, translation)
+  }, [isLive, selectedVerse, translation])
 
   return (
     <div
@@ -39,7 +43,28 @@ export function LiveOutputPanel() {
     >
       <PanelHeader title="Live display">
         <button
-          onClick={() => useBroadcastStore.getState().setLive(!isLive)}
+          type="button"
+          title="Previous verse"
+          aria-label="Previous verse"
+          onClick={() => void stepLiveVerse(false)}
+          className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <ChevronLeftIcon className="size-3.5" />
+        </button>
+        <button
+          type="button"
+          title="Next verse"
+          aria-label="Next verse"
+          onClick={() => void stepLiveVerse(true)}
+          className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <ChevronRightIcon className="size-3.5" />
+        </button>
+        <button
+          onClick={() => {
+            acquireOperatorLock()
+            useBroadcastStore.getState().setLive(!isLive)
+          }}
           className={cn(
             "flex items-center gap-2 rounded-full px-2.5 py-1 text-[0.625rem] font-medium uppercase tracking-wider transition-all",
             isLive

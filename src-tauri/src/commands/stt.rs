@@ -1,7 +1,13 @@
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use rhema_broadcast::{SuggestedVerse, VerseDisplay};
+use rhema_detection::{CursorMode, CursorState, VersePosition, VerseRef};
+
+use crate::suggestion::SuggestionEngine;
 
 use crate::events::{
     AudioLevelPayload, TranscriptPayload, EVENT_AUDIO_LEVEL, EVENT_TRANSCRIPT_FINAL,
@@ -576,8 +582,123 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
     has_high_confidence
 }
 
+/// Phase 5 (Bullet 5.3): ingest the sentence into the topic vector and, if a
+/// strong unshown thematically-related verse exists, surface ONE suggestion to
+/// the Operator channel. Runs in the background semantic worker (off the live
+/// transcript path). No-op when the semantic model/index is not loaded.
+fn run_topic_suggestion(app: &AppHandle, transcript: &str) {
+    // --- Under the AppState lock: ingest + topic search + priming boost. ---
+    let candidate: Option<(VerseRef, f32, String)> = {
+        let managed: State<'_, Mutex<AppState>> = app.state();
+        let mut state = match managed.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if !state.detection_pipeline.semantic.is_ready() {
+            return;
+        }
+        // Ingest this sentence's embedding into the time-decay topic vector.
+        if let Some(emb) = state.detection_pipeline.semantic.embed_text(transcript) {
+            state.sermon_context.ingest_embedding(emb);
+        }
+        let topic = match state.sermon_context.topic_vector() {
+            Some(t) => t,
+            None => return,
+        };
+        let hits = state.detection_pipeline.semantic.search_vector(&topic, 5);
+        if hits.is_empty() {
+            return;
+        }
+        let Some(db) = state.bible_db.as_ref() else {
+            return;
+        };
+        // Resolve verse ids → references (keep verse text for the payload).
+        let mut texts: Vec<(VerseRef, String)> = Vec::new();
+        let mut scored: Vec<(VerseRef, f32)> = Vec::new();
+        for (id, sim) in hits {
+            if let Ok(Some(v)) = db.get_verse_by_id(id) {
+                let vref = VerseRef {
+                    book_number: v.book_number,
+                    book_name: v.book_name.clone(),
+                    chapter: v.chapter,
+                    verse_start: v.verse,
+                    verse_end: None,
+                };
+                scored.push((vref.clone(), sim as f32));
+                texts.push((vref, v.text));
+            }
+        }
+        if scored.is_empty() {
+            return;
+        }
+        // Pre-service priming boost (Bullet 5.2), then take the best candidate.
+        state.priming_index.apply_boost(&mut scored);
+        let (best_ref, best_score) = scored.into_iter().next().unwrap();
+        let text = texts
+            .iter()
+            .find(|(r, _)| {
+                r.book_number == best_ref.book_number
+                    && r.chapter == best_ref.chapter
+                    && r.verse_start == best_ref.verse_start
+            })
+            .map(|(_, t)| t.clone())
+            .unwrap_or_default();
+        Some((best_ref, best_score, text))
+    };
+
+    let (best_ref, score, text) = match candidate {
+        Some(c) => c,
+        None => return,
+    };
+
+    // --- Gate via the SuggestionEngine (separate lock, dropped before emit). ---
+    let now = Instant::now();
+    {
+        let engine_state: State<'_, Mutex<SuggestionEngine>> = app.state();
+        let mut engine = match engine_state.lock() {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        if !engine.should_suggest(
+            &best_ref.book_name,
+            best_ref.chapter,
+            best_ref.verse_start,
+            score,
+            now,
+        ) {
+            return;
+        }
+        engine.note_suggested(now);
+    }
+
+    // --- Emit to the Operator channel ONLY. ---
+    let reference = format!(
+        "{} {}:{}",
+        best_ref.book_name, best_ref.chapter, best_ref.verse_start
+    );
+    log::info!("suggestion: proposing {} ({:.0}%)", reference, score * 100.0);
+    let suggestion = SuggestedVerse {
+        verse: VerseDisplay {
+            book: best_ref.book_name.clone(),
+            chapter: best_ref.chapter.max(0) as u16,
+            verse_start: best_ref.verse_start.max(0) as u16,
+            verse_end: None,
+            reference,
+            text,
+            translation: String::new(),
+        },
+        score,
+        reason: "Thematically related to current sermon context".to_string(),
+    };
+    crate::channels::route_suggestion(app, suggestion);
+}
+
 /// Run semantic (ONNX embedding) detection. Slow, runs in background worker.
 fn run_semantic_detection(app: &AppHandle, transcript: &str) {
+    // Phase 5: feed the topic vector and evaluate a proactive suggestion first
+    // (ingests every sentence this worker sees, regardless of detections below).
+    run_topic_suggestion(app, transcript);
+
     let epoch_at_detection = app.state::<EpochLock>().current();
     log::info!(
         "[DET-SEMANTIC] Running on: {:?}",
@@ -752,6 +873,42 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
 
     if let Some(advance) = advance {
         let _ = app.emit("reading_mode_verse", &advance);
+
+        // Phase 3 bridge: keep the formal navigation cursor in sync with the
+        // reading-mode advance, so a later manual next/previous-verse continues
+        // from the read position. Backend-internal (not via set_cursor_position),
+        // so it does NOT trip the §6.8 "manual nav exits reading mode" rule.
+        if (1..=66).contains(&advance.book_number) {
+            let managed: State<'_, Mutex<AppState>> = app.state();
+            let locked = managed.lock();
+            if let Ok(mut st) = locked {
+                let translation = match &st.cursor {
+                    Some(c) => c.position().translation.clone(),
+                    None => st
+                        .bible_db
+                        .as_ref()
+                        .and_then(|db| db.list_translations().ok())
+                        .and_then(|ts| {
+                            ts.into_iter()
+                                .find(|t| t.id == st.active_translation_id)
+                                .map(|t| t.abbreviation)
+                        })
+                        .unwrap_or_else(|| "KJV".to_string()),
+                };
+                if let Ok(pos) = VersePosition::new(
+                    advance.book_number as u8,
+                    advance.chapter as u16,
+                    advance.verse as u16,
+                    translation,
+                    None,
+                ) {
+                    match &mut st.cursor {
+                        Some(c) => c.navigate_to(pos, CursorMode::Reading),
+                        None => st.cursor = Some(CursorState::new(pos, CursorMode::Reading)),
+                    }
+                }
+            }
+        }
 
         // Also emit as a verse_detection so it appears in the detections panel
         let confidence = advance.confidence;

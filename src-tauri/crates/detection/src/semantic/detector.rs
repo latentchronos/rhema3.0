@@ -179,6 +179,25 @@ impl SemanticDetector {
         }
     }
 
+    /// Embed arbitrary text to a raw vector (Phase 5 topic-vector ingest).
+    /// Returns `None` on embedding failure. Does not require a loaded index.
+    pub fn embed_text(&self, text: &str) -> Option<Vec<f32>> {
+        self.embedder.embed(text).ok()
+    }
+
+    /// Search the index by a PRECOMPUTED embedding — e.g. the sermon topic
+    /// vector (Phase 5, Bullet 5.3). Unlike `search_query`, no text embedding
+    /// step. Returns `(verse_id, similarity)`; empty when the index is not ready.
+    pub fn search_vector(&self, embedding: &[f32], k: usize) -> Vec<(i64, f64)> {
+        if !self.is_ready() {
+            return vec![];
+        }
+        match self.index.search(embedding, k) {
+            Ok(results) => results.iter().map(|r| (r.verse_id, r.similarity)).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     // ---- private helpers ----
 
     fn timestamp_ms() -> u64 {

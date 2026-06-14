@@ -147,3 +147,62 @@ describe("broadcast store — Phase 4 channel model (additive)", () => {
     })
   })
 })
+
+describe("go-live channel commit (Bullet 4.5)", () => {
+  beforeEach(() => {
+    emitToMock.mockReset()
+    emitToMock.mockResolvedValue(undefined)
+    invokeMock.mockReset()
+    invokeMock.mockResolvedValue(undefined)
+    vi.resetModules()
+  })
+
+  const verse = {
+    id: 1,
+    translation_id: 1,
+    book_number: 45,
+    book_name: "Romans",
+    book_abbreviation: "Rom",
+    chapter: 8,
+    verse: 1,
+    text: "There is therefore now no condemnation",
+  }
+
+  it("commitLiveVerse maps Verse -> ChannelVerse and invokes commit_live_verse", async () => {
+    const { useBroadcastStore } = await import("./broadcast-store")
+    const { commitLiveVerse } = await import("../hooks/use-broadcast")
+
+    commitLiveVerse(verse, "KJV")
+
+    // Legacy render path retained.
+    expect(useBroadcastStore.getState().liveVerse?.reference).toContain(
+      "Romans 8:1"
+    )
+    // Channel command fired with the lossless mapping + active theme.
+    expect(invokeMock).toHaveBeenCalledWith("commit_live_verse", {
+      verse: {
+        book: "Romans",
+        chapter: 8,
+        verse_start: 1,
+        verse_end: null,
+        reference: "Romans 8:1",
+        text: "There is therefore now no condemnation",
+        translation: "KJV",
+      },
+      themeId: expect.any(String),
+    })
+  })
+
+  it("commitLiveVerse(null) blanks the audience channel", async () => {
+    const { useBroadcastStore } = await import("./broadcast-store")
+    const { commitLiveVerse } = await import("../hooks/use-broadcast")
+
+    commitLiveVerse(null, "KJV")
+
+    expect(useBroadcastStore.getState().liveVerse).toBeNull()
+    expect(invokeMock).toHaveBeenCalledWith("commit_live_verse", {
+      verse: null,
+      themeId: expect.any(String),
+    })
+  })
+})

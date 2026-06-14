@@ -2,7 +2,9 @@ mod channels;
 mod commands;
 mod epoch;
 mod events;
+mod nav_lookup;
 mod state;
+mod suggestion;
 mod suppression;
 
 use std::sync::Mutex;
@@ -28,6 +30,7 @@ pub fn run() {
         .manage(Mutex::new(rhema_detection::ReadingMode::new()))
         .manage(Mutex::new(commands::obs::ObsOverlayServer::default()))
         .manage(Mutex::new(channels::ChannelState::default()))
+        .manage(Mutex::new(suggestion::SuggestionEngine::new()))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -46,6 +49,11 @@ pub fn run() {
             commands::detection::quotation_search,
             commands::detection::reading_mode_status,
             commands::detection::stop_reading_mode,
+            commands::detection::set_sermon_notes,
+            commands::detection::dismiss_suggestion,
+            commands::detection::set_cursor_position,
+            commands::detection::next_verse,
+            commands::detection::previous_verse,
             commands::audio::get_audio_devices,
             commands::stt::start_transcription,
             commands::stt::stop_transcription,

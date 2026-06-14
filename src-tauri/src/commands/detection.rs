@@ -3,7 +3,9 @@ use tauri::State;
 
 use crate::epoch::EpochLock;
 use crate::state::AppState;
-use rhema_detection::{MergedDetection, ReadingMode};
+use rhema_detection::{
+    CursorMode, CursorState, MergedDetection, NavOutcome, PrimingIndex, ReadingMode, VersePosition,
+};
 use serde::Serialize;
 
 /// Serializable detection result for the frontend
@@ -24,6 +26,172 @@ pub struct DetectionResult {
     pub decision: String,
     pub explanation: String,
     pub transcript_snippet: String,
+}
+
+/// A verse resolved by a navigation command, for the frontend to project.
+#[derive(Clone, Serialize)]
+pub struct NavVerse {
+    pub book_number: i32,
+    pub book_name: String,
+    pub chapter: i32,
+    pub verse: i32,
+    pub text: String,
+    pub reference: String,
+}
+
+/// Seed / update the formal navigation cursor (Phase 3 app-side follow-up).
+/// Called by the frontend whenever a verse goes live, so next/previous-verse
+/// navigate from the current live position. No-op when already on that verse
+/// (so re-committing after a nav step doesn't reset history) or when the verse
+/// has no resolvable book number (book_number < 1, e.g. a name-only suggestion).
+#[tauri::command]
+pub fn set_cursor_position(
+    book_number: i32,
+    chapter: i32,
+    verse: i32,
+    translation: String,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<(), String> {
+    if !(1..=66).contains(&book_number) {
+        return Ok(());
+    }
+    let book = book_number as u8;
+    let chapter = chapter.max(1) as u16;
+    let verse = verse.max(1) as u16;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    if let Some(cursor) = &app_state.cursor {
+        let p = cursor.position();
+        if p.book == book && p.chapter == chapter && p.verse == verse && p.translation == translation
+        {
+            return Ok(());
+        }
+    }
+    let position = match VersePosition::new(book, chapter, verse, translation, None) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    match &mut app_state.cursor {
+        Some(cursor) => cursor.navigate_to(position, CursorMode::Single),
+        None => app_state.cursor = Some(CursorState::new(position, CursorMode::Single)),
+    }
+    Ok(())
+}
+
+/// Advance the cursor to the next verse (Phase 3.4/3.5 bounds via BibleDb).
+/// Returns the resolved verse for the frontend to project, or `None` on a Bible
+/// boundary / cold cursor / lookup failure.
+#[tauri::command]
+pub fn next_verse(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<Option<NavVerse>, String> {
+    navigate(state, reading, true)
+}
+
+/// Step the cursor to the previous verse. See [`next_verse`].
+#[tauri::command]
+pub fn previous_verse(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<Option<NavVerse>, String> {
+    navigate(state, reading, false)
+}
+
+/// Deactivate reading mode if active — manual navigation exits it (§6.8).
+fn exit_reading_mode(reading: &Mutex<ReadingMode>) {
+    if let Ok(mut rm) = reading.lock() {
+        if rm.is_active() {
+            rm.deactivate();
+        }
+    }
+}
+
+fn navigate(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+    forward: bool,
+) -> Result<Option<NavVerse>, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(None);
+    };
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = if forward {
+        cursor.next_verse(&lookup)
+    } else {
+        cursor.previous_verse(&lookup)
+    };
+    if !matches!(outcome, NavOutcome::Moved) {
+        return Ok(None);
+    }
+
+    let p = cursor.position().clone();
+    let tid = db
+        .list_translations()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|t| t.abbreviation.eq_ignore_ascii_case(&p.translation))
+        .map(|t| t.id);
+    let Some(tid) = tid else {
+        return Ok(None);
+    };
+    let resolved = db
+        .get_verse(tid, p.book as i32, p.chapter as i32, p.verse as i32)
+        .map_err(|e| e.to_string())?;
+    Ok(resolved.map(|v| NavVerse {
+        book_number: v.book_number,
+        book_name: v.book_name.clone(),
+        chapter: v.chapter,
+        verse: v.verse,
+        text: v.text,
+        reference: format!("{} {}:{}", v.book_name, v.chapter, v.verse),
+    }))
+}
+
+/// Set the pastor's pre-service sermon notes (Phase 5, Bullet 5.2). Parses the
+/// notes for explicit verse references and stores a priming index in `AppState`;
+/// those verses receive a +0.25 boost in later suggestion ranking. Returns the
+/// number of primed verse coordinates (for an operator-facing confirmation).
+/// Rebuilds the index on every call (pastor may edit notes mid-service).
+#[tauri::command]
+pub fn set_sermon_notes(notes: String, state: State<'_, Mutex<AppState>>) -> Result<usize, String> {
+    let index = PrimingIndex::build_from_notes(&notes);
+    let count = index.len();
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    app_state.priming_index = index;
+    log::info!("priming: set_sermon_notes indexed {count} primed verse(s)");
+    Ok(count)
+}
+
+/// Operator dismisses a proactive suggestion (Phase 5, Bullet 5.3). The verse is
+/// suppressed from further suggestions for the rest of the service.
+#[tauri::command]
+pub fn dismiss_suggestion(
+    book: String,
+    chapter: i32,
+    verse: i32,
+    engine: State<'_, Mutex<crate::suggestion::SuggestionEngine>>,
+) -> Result<(), String> {
+    engine
+        .lock()
+        .map_err(|e| e.to_string())?
+        .dismiss(&book, chapter, verse);
+    log::info!("suggestion: dismissed {book} {chapter}:{verse} for the service");
+    Ok(())
 }
 
 fn source_to_string(source: &rhema_detection::DetectionSource) -> String {

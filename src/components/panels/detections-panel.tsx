@@ -4,8 +4,9 @@ import { Button } from "@/components/ui/button"
 import { PlayIcon, PlusIcon } from "lucide-react"
 import { useDetection, detectionActions } from "@/hooks/use-detection"
 import { bibleActions } from "@/hooks/use-bible"
-import { useQueueStore, useBroadcastStore, useBibleStore } from "@/stores"
-import { toVerseRenderData } from "@/hooks/use-broadcast"
+import { useQueueStore, useBibleStore } from "@/stores"
+import { commitLiveVerse } from "@/hooks/use-broadcast"
+import { acquireOperatorLock } from "@/lib/operator-lock"
 import type { DetectionResult } from "@/types"
 import type { QueueItem } from "@/types"
 
@@ -55,6 +56,7 @@ function formatPercent(value: number) {
 
 function DetectionCard({ detection }: { detection: DetectionResult }) {
   const handlePresent = () => {
+    acquireOperatorLock()
     // Select this verse for preview
     bibleActions.selectVerse({
       id: 0,
@@ -81,20 +83,18 @@ function DetectionCard({ detection }: { detection: DetectionResult }) {
         .translations.find(
           (t) => t.id === useBibleStore.getState().activeTranslationId
         )?.abbreviation ?? "KJV"
-    useBroadcastStore.getState().setLiveVerse(
-      toVerseRenderData(
-        {
-          id: 0,
-          translation_id: 1,
-          book_number: detection.book_number,
-          book_name: detection.book_name,
-          book_abbreviation: "",
-          chapter: detection.chapter,
-          verse: detection.verse,
-          text: detection.verse_text,
-        },
-        translation
-      )
+    commitLiveVerse(
+      {
+        id: 0,
+        translation_id: 1,
+        book_number: detection.book_number,
+        book_name: detection.book_name,
+        book_abbreviation: "",
+        chapter: detection.chapter,
+        verse: detection.verse,
+        text: detection.verse_text,
+      },
+      translation
     )
   }
 

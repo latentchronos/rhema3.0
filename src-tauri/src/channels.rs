@@ -21,11 +21,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rhema_broadcast::ndi::NdiRuntime;
 use rhema_broadcast::{
     AudienceChannel, DetectionResult as ChannelDetection, DeviceConnection, DeviceStatus,
-    OperatorChannel, PastorChannel, RoutingMode, VerseDisplay,
+    OperatorChannel, PastorChannel, RoutingMode, SuggestedVerse, VerseDisplay,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::commands::obs::ObsOverlayServer;
+use crate::suggestion::SuggestionEngine;
 
 /// Health-probe interval (ARCHITECTURE §11.9 — "every 2 s").
 const PING_INTERVAL_SECS: u64 = 2;
@@ -134,6 +135,22 @@ pub fn route_detections(app: &AppHandle, kept: &[crate::commands::detection::Det
     publish_operator(app, &snapshot);
 }
 
+/// Route a proactive suggestion to the **Operator channel only** (Bullet 5.3).
+/// Replaces the current suggestion list with the latest single suggestion and
+/// re-publishes the operator channel. Never reaches the audience/pastor windows.
+pub fn route_suggestion(app: &AppHandle, suggestion: SuggestedVerse) {
+    let managed: State<'_, Mutex<ChannelState>> = app.state();
+    let snapshot = match managed.lock() {
+        Ok(mut s) => {
+            s.operator.suggestions = vec![suggestion];
+            s.operator.routing_state = s.routing_mode;
+            s.operator.clone()
+        }
+        Err(_) => return,
+    };
+    publish_operator(app, &snapshot);
+}
+
 /// Operator action: set the routing mode and re-publish the pastor + operator
 /// channels so all subscribers reflect the change. The frontend toggle (Bullet
 /// 4.4) calls this; nothing auto-projects as a result.
@@ -166,6 +183,16 @@ pub fn commit_live_verse(
     verse: Option<VerseDisplay>,
     theme_id: String,
 ) -> Result<(), String> {
+    // Record the live verse in the suggestion engine's display history so it is
+    // never re-suggested (Bullet 5.3). Separate lock, taken/dropped first.
+    if let Some(v) = &verse {
+        if let Some(engine) = app.try_state::<Mutex<SuggestionEngine>>() {
+            if let Ok(mut e) = engine.lock() {
+                e.record_displayed(&v.book, v.chapter as i32, v.verse_start as i32);
+            }
+        }
+    }
+
     let (audience, pastor) = {
         let mut s = state.lock().map_err(|e| e.to_string())?;
         apply_commit(&mut s, verse, theme_id);
