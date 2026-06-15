@@ -192,6 +192,7 @@ dependencies = [
  "crossbeam-channel",
  "dotenvy",
  "log",
+ "rhema-api",
  "rhema-audio",
  "rhema-bible",
  "rhema-broadcast",
@@ -4104,6 +4105,7 @@ name = "rhema-api"
 version = "0.1.0"
 dependencies = [
  "log",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

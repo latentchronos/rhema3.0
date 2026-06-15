@@ -31,6 +31,7 @@ pub fn run() {
         .manage(Mutex::new(commands::obs::ObsOverlayServer::default()))
         .manage(Mutex::new(channels::ChannelState::default()))
         .manage(Mutex::new(suggestion::SuggestionEngine::new()))
+        .manage(Mutex::new(Option::<rhema_api::llm::LlmConfig>::None))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -54,6 +55,8 @@ pub fn run() {
             commands::detection::set_cursor_position,
             commands::detection::next_verse,
             commands::detection::previous_verse,
+            commands::detection::go_to_reference,
+            commands::detection::step_verses,
             commands::detection::start_session,
             commands::detection::end_session,
             commands::detection::session_status,
@@ -74,13 +77,17 @@ pub fn run() {
             commands::obs::push_obs_overlay,
             channels::set_routing_mode,
             channels::commit_live_verse,
+            commands::llm::set_llm_config,
+            commands::llm::llm_status,
+            commands::llm::clear_llm_config,
         ])
         .setup(|app| {
             use tauri::Manager;
 
-            // Phase 2: drain the Stage-2 (LLM fallback) channel. The detection
-            // pipeline queues ambiguous transcripts; this placeholder logs them.
-            // Phase 5 replaces the placeholder with the real Claude API call.
+            // Drain the Stage-2 (LLM fallback) channel (Bullet L5). The detection
+            // pipeline queues ambiguous transcripts; the worker classifies each
+            // via the configured multi-provider LLM and routes scripture hits
+            // back through direct detection. No-op until a provider is configured.
             {
                 let stage2_rx = app
                     .state::<Mutex<state::AppState>>()
@@ -89,7 +96,8 @@ pub fn run() {
                     .detection_pipeline
                     .take_stage2_receiver();
                 if let Some(rx) = stage2_rx {
-                    tauri::async_runtime::spawn(rhema_detection::run_stage2_placeholder(rx));
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(commands::stt::run_stage2_worker(handle, rx));
                 }
             }
 

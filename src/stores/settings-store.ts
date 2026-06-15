@@ -4,6 +4,12 @@ interface SettingsState {
   deepgramApiKey: string | null
   openaiApiKey: string | null
   claudeApiKey: string | null
+  // Stage-2 multi-provider LLM config (Track L). `llmProvider` is the UI
+  // selection: "auto" | "anthropic" | "openai" | "gemini" | "custom".
+  llmProvider: string | null
+  llmApiKey: string | null
+  llmBaseUrl: string | null
+  llmModel: string | null
   activeTranslationId: number
   audioDeviceId: string | null
   audioChannelIndex: number | null
@@ -17,6 +23,10 @@ interface SettingsState {
   setDeepgramApiKey: (key: string | null) => void
   setOpenaiApiKey: (key: string | null) => void
   setClaudeApiKey: (key: string | null) => void
+  setLlmProvider: (provider: string | null) => void
+  setLlmApiKey: (key: string | null) => void
+  setLlmBaseUrl: (url: string | null) => void
+  setLlmModel: (model: string | null) => void
   setActiveTranslationId: (id: number) => void
   setAudioDeviceId: (id: string | null) => void
   setAudioChannelIndex: (id: number | null) => void
@@ -32,6 +42,10 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   deepgramApiKey: null,
   openaiApiKey: null,
   claudeApiKey: null,
+  llmProvider: null,
+  llmApiKey: null,
+  llmBaseUrl: null,
+  llmModel: null,
   activeTranslationId: 1,
   audioDeviceId: null,
   audioChannelIndex: null,
@@ -45,6 +59,10 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setDeepgramApiKey: (deepgramApiKey) => set({ deepgramApiKey }),
   setOpenaiApiKey: (openaiApiKey) => set({ openaiApiKey }),
   setClaudeApiKey: (claudeApiKey) => set({ claudeApiKey }),
+  setLlmProvider: (llmProvider) => set({ llmProvider }),
+  setLlmApiKey: (llmApiKey) => set({ llmApiKey }),
+  setLlmBaseUrl: (llmBaseUrl) => set({ llmBaseUrl }),
+  setLlmModel: (llmModel) => set({ llmModel }),
   setActiveTranslationId: (activeTranslationId) => set({ activeTranslationId }),
   setAudioDeviceId: (audioDeviceId) => set({ audioDeviceId }),
   setAudioChannelIndex: (audioChannelIndex) => set({ audioChannelIndex }),

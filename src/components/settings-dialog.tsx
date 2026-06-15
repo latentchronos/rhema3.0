@@ -37,6 +37,7 @@ import {
   SettingsIcon,
   CheckIcon,
   BookOpenIcon,
+  SparklesIcon,
 } from "lucide-react"
 import { useSettingsStore } from "@/stores"
 import type { DeviceInfo } from "@/types/audio"
@@ -45,7 +46,7 @@ import type { DeviceInfo } from "@/types/audio"
 /*  Nav definition                                                            */
 /* -------------------------------------------------------------------------- */
 
-type NavSection = "audio" | "bible" | "display" | "api-keys"
+type NavSection = "audio" | "bible" | "display" | "api-keys" | "ai-model"
 
 const navItems: { name: string; id: NavSection; icon: React.ReactNode }[] = [
   {
@@ -67,6 +68,11 @@ const navItems: { name: string; id: NavSection; icon: React.ReactNode }[] = [
     name: "API Keys",
     id: "api-keys",
     icon: <KeyIcon strokeWidth={2} />,
+  },
+  {
+    name: "AI Model",
+    id: "ai-model",
+    icon: <SparklesIcon strokeWidth={2} />,
   },
 ]
 
@@ -376,13 +382,205 @@ function ApiKeysSection() {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Section: AI Model (Stage-2 LLM)                                            */
+/* -------------------------------------------------------------------------- */
+
+type LlmProviderSel = "auto" | "anthropic" | "openai" | "gemini" | "custom"
+
+interface LlmStatus {
+  configured: boolean
+  provider: string | null
+  model: string | null
+  base_url: string | null
+}
+
+const providerOptions: { value: LlmProviderSel; label: string }[] = [
+  { value: "auto", label: "Auto-detect from key" },
+  { value: "anthropic", label: "Claude (Anthropic)" },
+  { value: "openai", label: "OpenAI / ChatGPT" },
+  { value: "gemini", label: "Google Gemini" },
+  { value: "custom", label: "Custom (OpenAI-compatible)" },
+]
+
+/** Map the UI selection to the backend `ProviderKind` arg (null = auto-detect). */
+function backendProvider(sel: LlmProviderSel): string | null {
+  switch (sel) {
+    case "auto":
+      return null
+    case "anthropic":
+      return "anthropic"
+    case "gemini":
+      return "gemini"
+    case "openai":
+    case "custom":
+      return "open_ai_compatible"
+  }
+}
+
+function AiModelSection() {
+  const {
+    llmProvider,
+    llmApiKey,
+    llmBaseUrl,
+    llmModel,
+    setLlmProvider,
+    setLlmApiKey,
+    setLlmBaseUrl,
+    setLlmModel,
+  } = useSettingsStore()
+
+  const [sel, setSel] = useState<LlmProviderSel>(
+    (llmProvider as LlmProviderSel) ?? "auto"
+  )
+  const [keyValue, setKeyValue] = useState(llmApiKey ?? "")
+  const [base, setBase] = useState(llmBaseUrl ?? "")
+  const [model, setModel] = useState(llmModel ?? "")
+  const [status, setStatus] = useState<LlmStatus | null>(null)
+  const [saved, setSaved] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    void invoke<LlmStatus>("llm_status").then(setStatus).catch(() => {})
+  }, [])
+
+  const handleSave = async () => {
+    setError(null)
+    if (!keyValue.trim()) {
+      await invoke("clear_llm_config").catch(() => {})
+      setLlmApiKey(null)
+      setStatus({ configured: false, provider: null, model: null, base_url: null })
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+      return
+    }
+    try {
+      await invoke<string>("set_llm_config", {
+        provider: backendProvider(sel),
+        apiKey: keyValue.trim(),
+        baseUrl: sel === "custom" ? base.trim() || null : null,
+        model: model.trim() || null,
+      })
+      setLlmProvider(sel)
+      setLlmApiKey(keyValue.trim())
+      setLlmBaseUrl(sel === "custom" ? base.trim() || null : null)
+      setLlmModel(model.trim() || null)
+      const s = await invoke<LlmStatus>("llm_status")
+      setStatus(s)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 2000)
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      <p className="text-[0.625rem] leading-relaxed text-muted-foreground">
+        When the speaker mentions a passage without naming it outright, Rhema can
+        ask an AI model to help find it. Paste any provider&apos;s key — Claude,
+        OpenAI/ChatGPT, Gemini, or any OpenAI-compatible model (DeepSeek, Qwen,
+        Groq, local Ollama, …) via the Custom option.
+      </p>
+
+      {/* Provider */}
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Provider
+        </label>
+        <Select value={sel} onValueChange={(v) => setSel(v as LlmProviderSel)}>
+          <SelectTrigger className="h-8 text-xs">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {providerOptions.map((o) => (
+              <SelectItem key={o.value} value={o.value}>
+                {o.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* API key */}
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center gap-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            API Key
+          </label>
+          {status?.configured && (
+            <Badge variant="outline" className="text-[0.5rem]">
+              {status.provider ?? "configured"}
+              {status.model ? ` · ${status.model}` : ""}
+            </Badge>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <Input
+            type="password"
+            placeholder="Paste your model API key..."
+            value={keyValue}
+            onChange={(e) => setKeyValue(e.target.value)}
+            className="flex-1 text-xs"
+          />
+          <Button size="sm" onClick={() => void handleSave()}>
+            {saved ? (
+              <>
+                <CheckIcon className="size-3" />
+                Saved
+              </>
+            ) : (
+              "Save"
+            )}
+          </Button>
+        </div>
+        {error && <p className="text-[0.625rem] text-destructive">{error}</p>}
+      </div>
+
+      {/* Custom OpenAI-compatible: base URL */}
+      {sel === "custom" && (
+        <div className="flex flex-col gap-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Base URL
+          </label>
+          <Input
+            placeholder="https://api.deepseek.com"
+            value={base}
+            onChange={(e) => setBase(e.target.value)}
+            className="text-xs"
+          />
+          <p className="text-[0.625rem] text-muted-foreground">
+            The provider&apos;s OpenAI-compatible endpoint root (no trailing
+            /v1/chat/completions).
+          </p>
+        </div>
+      )}
+
+      {/* Optional model override */}
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Model (optional)
+        </label>
+        <Input
+          placeholder="Leave blank for the provider default"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+          className="text-xs"
+        />
+      </div>
+    </div>
+  )
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Section titles                                                            */
 /* -------------------------------------------------------------------------- */
 
 const sectionTitles: Record<NavSection, string> = {
   audio: "Audio",
+  bible: "Bible",
   display: "Display Mode",
   "api-keys": "API Keys",
+  "ai-model": "AI Model",
 }
 
 /* -------------------------------------------------------------------------- */
@@ -490,6 +688,7 @@ const sectionComponents: Record<NavSection, React.FC> = {
   bible: BibleSection,
   display: DisplayModeSection,
   "api-keys": ApiKeysSection,
+  "ai-model": AiModelSection,
 }
 
 /* -------------------------------------------------------------------------- */

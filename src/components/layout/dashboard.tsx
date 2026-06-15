@@ -6,6 +6,7 @@ import { QueuePanel } from "@/components/panels/queue-panel"
 import { SearchPanel } from "@/components/panels/search-panel"
 import { DetectionsPanel } from "@/components/panels/detections-panel"
 import { SuggestionsPanel } from "@/components/panels/suggestions-panel"
+import { Toaster } from "@/components/ui/toaster"
 import { useChannels } from "@/hooks/use-channels"
 import { useVoiceCommands } from "@/hooks/use-voice-commands"
 
@@ -59,6 +60,7 @@ export function Dashboard() {
           <SuggestionsPanel />
         </div>
       </div>
+      <Toaster />
     </div>
     // <div
     //   style={{

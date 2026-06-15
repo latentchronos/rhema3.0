@@ -3,8 +3,10 @@ use tauri::State;
 
 use crate::epoch::EpochLock;
 use crate::state::AppState;
+use rhema_bible::BibleDb;
 use rhema_detection::{
-    CursorMode, CursorState, MergedDetection, NavOutcome, PrimingIndex, ReadingMode, VersePosition,
+    CursorMode, CursorState, MergedDetection, NavDirection, NavOutcome, NavUnit, PrimingIndex,
+    ReadingMode, VersePosition,
 };
 use serde::Serialize;
 
@@ -201,6 +203,149 @@ fn navigate(
         text: v.text,
         reference: format!("{} {}:{}", v.book_name, v.chapter, v.verse),
     }))
+}
+
+/// Resolve a translation abbreviation (e.g. "KJV") to its DB id.
+fn resolve_tid(db: &BibleDb, translation: &str) -> Option<i64> {
+    db.list_translations()
+        .ok()?
+        .into_iter()
+        .find(|t| t.abbreviation.eq_ignore_ascii_case(translation))
+        .map(|t| t.id)
+}
+
+/// Build a `NavVerse` for the verse at `p`, or `None` if it can't be resolved.
+fn nav_verse_at(db: &BibleDb, tid: i64, p: &VersePosition) -> Option<NavVerse> {
+    let v = db
+        .get_verse(tid, p.book as i32, p.chapter as i32, p.verse as i32)
+        .ok()??;
+    Some(NavVerse {
+        book_number: v.book_number,
+        book_name: v.book_name.clone(),
+        chapter: v.chapter,
+        verse: v.verse,
+        text: v.text,
+        reference: format!("{} {}:{}", v.book_name, v.chapter, v.verse),
+    })
+}
+
+/// Outcome of a structured navigation command (Bullet V4), serialized for the UI
+/// as `{ "status": "moved" | "no_change" | "chapter_out_of_range" | "verse_out_of_range", ... }`.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NavCommandResult {
+    /// The cursor moved — project this verse.
+    Moved { verse: NavVerse },
+    /// Nothing happened (Bible boundary, cold cursor, or unresolved lookup).
+    NoChange,
+    /// The requested chapter does not exist in the current book/translation.
+    ChapterOutOfRange {
+        book_name: String,
+        requested: u16,
+        last_chapter: u16,
+    },
+    /// The requested verse does not exist in the current chapter/translation
+    /// (past the end, or omitted in this version).
+    VerseOutOfRange {
+        book_name: String,
+        chapter: u16,
+        requested: u16,
+        last_verse: u16,
+    },
+}
+
+/// Absolute navigation (Bullet V4): jump within the current book. `chapter`/
+/// `verse` are optional — `None` chapter stays in the current chapter, `None`
+/// verse lands on verse 1. Validated against the active translation; returns the
+/// resolved verse, or an out-of-range result the UI surfaces as a toast.
+#[tauri::command]
+pub fn go_to_reference(
+    chapter: Option<u16>,
+    verse: Option<u16>,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let before = cursor.position().clone();
+    let Some(tid) = resolve_tid(db, &before.translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+    let req_chapter = chapter.unwrap_or(before.chapter);
+    let req_verse = verse.unwrap_or(1);
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = cursor.jump_to(&lookup, chapter, verse);
+
+    let book_name = || nav_verse_at(db, tid, &before).map(|v| v.book_name).unwrap_or_default();
+    Ok(match outcome {
+        NavOutcome::Moved => match nav_verse_at(db, tid, cursor.position()) {
+            Some(verse) => NavCommandResult::Moved { verse },
+            None => NavCommandResult::NoChange,
+        },
+        NavOutcome::ChapterOutOfRange { last_chapter } => NavCommandResult::ChapterOutOfRange {
+            book_name: book_name(),
+            requested: req_chapter,
+            last_chapter,
+        },
+        NavOutcome::VerseOutOfRange { last_verse } => NavCommandResult::VerseOutOfRange {
+            book_name: book_name(),
+            chapter: req_chapter,
+            requested: req_verse,
+            last_verse,
+        },
+        NavOutcome::AtBibleBoundary | NavOutcome::LookupFailed => NavCommandResult::NoChange,
+    })
+}
+
+/// Relative navigation (Bullet V4): step `count` verses or chapters in either
+/// direction. Moves as far as possible; returns the resolved verse or `NoChange`
+/// at a Bible boundary / cold cursor.
+#[tauri::command]
+pub fn step_verses(
+    unit: NavUnit,
+    direction: NavDirection,
+    count: u16,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let Some(tid) = resolve_tid(db, &cursor.position().translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = cursor.step_n(&lookup, unit, direction, count);
+
+    Ok(match outcome {
+        NavOutcome::Moved => match nav_verse_at(db, tid, cursor.position()) {
+            Some(verse) => NavCommandResult::Moved { verse },
+            None => NavCommandResult::NoChange,
+        },
+        _ => NavCommandResult::NoChange,
+    })
 }
 
 /// Set the pastor's pre-service sermon notes (Phase 5, Bullet 5.2). Parses the

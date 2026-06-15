@@ -1,22 +1,15 @@
-import { useBroadcastStore } from "@/stores"
 import { useTauriEvent } from "./use-tauri-event"
-import { stepLiveVerse } from "./use-broadcast"
+import { applyVoiceNavCommand, type NavCommand } from "./use-broadcast"
 
 /**
- * Listens for backend-emitted voice control commands (Gap 2 live wiring) and
- * drives the same actions as the operator's buttons, so spoken "next verse" /
- * "previous verse" / "clear screen" work. Mount once in a long-lived component.
+ * Listens for backend-emitted structured voice commands (Bullet V5/V6) and
+ * drives the navigation cursor: spoken "next verse", "back three verses",
+ * "go to verse 7", "chapter 3 verse 16", "clear screen", etc. Absolute jumps and
+ * relative steps are validated against the active translation backend-side; an
+ * out-of-range target surfaces a toast instead of moving. Mount once.
  */
 export function useVoiceCommands() {
-  useTauriEvent<string>("voice_command", (action) => {
-    if (action === "next") {
-      void stepLiveVerse(true)
-    } else if (action === "previous") {
-      void stepLiveVerse(false)
-    } else if (action === "clear") {
-      const s = useBroadcastStore.getState()
-      s.setLiveVerse(null)
-      s.setLive(false)
-    }
+  useTauriEvent<NavCommand>("voice_command", (cmd) => {
+    void applyVoiceNavCommand(cmd)
   })
 }

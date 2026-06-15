@@ -544,21 +544,19 @@ enum FinalJob {
     UtteranceEnd,
 }
 
-/// Intent layer, live wiring (Gap 2). Map a short voice control utterance to an
-/// action and emit it to the frontend (`voice_command`); escalate an ambiguous
-/// command attempt to the Stage-2 fallback. Only short, command-like utterances
-/// are considered, so ordinary preaching never triggers navigation.
+/// Intent layer, live wiring (Gap 2 / Bullet V5). Parse a short voice utterance
+/// into a structured [`rhema_detection::NavCommand`] (absolute jump, relative
+/// step, or clear) and emit it to the frontend (`voice_command`); escalate an
+/// ambiguous command attempt to the Stage-2 fallback. Only short, command-like
+/// utterances are considered, so ordinary preaching never triggers navigation.
 fn check_voice_command(app: &AppHandle, transcript: &str) {
-    use rhema_detection::{is_control_command, parse_control_action, ControlAction};
+    use rhema_detection::{is_control_command, parse_nav_command};
 
-    if let Some(action) = parse_control_action(transcript) {
-        let name = match action {
-            ControlAction::NextVerse => "next",
-            ControlAction::PreviousVerse => "previous",
-            ControlAction::Clear => "clear",
-        };
-        log::info!("voice_command: {name} (from '{transcript}')");
-        let _ = app.emit("voice_command", name);
+    if let Some(cmd) = parse_nav_command(transcript) {
+        // Emit the structured command (jump / step / clear) for the frontend to
+        // route through the navigation cursor (Bullet V5).
+        log::info!("voice_command: {cmd:?} (from '{transcript}')");
+        let _ = app.emit("voice_command", cmd);
     } else if transcript.split_whitespace().count() <= 4 && is_control_command(transcript) {
         // Command-shaped but unrecognized → genuinely ambiguous; escalate to the
         // Stage-2 fallback (placeholder until 5.4 wires the real Claude call).
@@ -566,6 +564,50 @@ fn check_voice_command(app: &AppHandle, transcript: &str) {
         let locked = managed.try_lock();
         if let Ok(state) = locked {
             state.detection_pipeline.queue_stage2(transcript);
+        }
+    }
+}
+
+/// Drain the Stage-2 (LLM fallback) channel and run the real multi-provider
+/// classification (Bullet L5). For each ambiguous transcript, read the current
+/// provider config; if one is set, ask the provider whether the utterance refers
+/// to scripture and, when it does, resolve the returned reference through direct
+/// detection so it surfaces like any other detection. No-op when unconfigured.
+pub async fn run_stage2_worker(
+    app: AppHandle,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    use rhema_api::llm::{self, LlmConfig, Stage2Request};
+
+    while let Some(transcript) = rx.recv().await {
+        let config: Option<LlmConfig> = app
+            .state::<Mutex<Option<LlmConfig>>>()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        let Some(config) = config else {
+            continue; // no provider configured → Stage-2 disabled
+        };
+        if !config.is_usable() {
+            continue;
+        }
+
+        let req = Stage2Request {
+            transcript: transcript.clone(),
+            context: None,
+        };
+        match llm::classify(&config, &req).await {
+            Ok(res) if res.is_scripture => {
+                if let Some(reference) = res.reference {
+                    log::info!(
+                        "stage2: '{transcript}' → {reference} (confidence {:.2})",
+                        res.confidence
+                    );
+                    run_direct_detection(&app, &reference);
+                }
+            }
+            Ok(_) => log::debug!("stage2: '{transcript}' not scripture"),
+            Err(e) => log::warn!("stage2 classify error: {e}"),
         }
     }
 }

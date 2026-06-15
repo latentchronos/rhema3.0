@@ -216,6 +216,99 @@ impl CursorState {
         )
     }
 
+    /// Absolute jump to a target within the **current book** (Bullet V3).
+    ///
+    /// `chapter == None` keeps the current chapter; `verse == None` lands on
+    /// verse 1. Validated against the active translation via `lookup`: a chapter
+    /// past the book's end yields [`NavOutcome::ChapterOutOfRange`]; a verse that
+    /// is past the chapter's end or omitted yields [`NavOutcome::VerseOutOfRange`].
+    /// Neither moves the cursor.
+    pub fn jump_to(
+        &mut self,
+        lookup: &dyn VerseLookup,
+        chapter: Option<u16>,
+        verse: Option<u16>,
+    ) -> NavOutcome {
+        let p = self.position.clone();
+        let t = &p.translation;
+        let book = p.book;
+        let chapter = chapter.unwrap_or(p.chapter);
+        let verse = verse.unwrap_or(1);
+
+        match lookup.last_chapter(t, book) {
+            Some(last_chapter) if chapter >= 1 && chapter <= last_chapter => {}
+            Some(last_chapter) => return NavOutcome::ChapterOutOfRange { last_chapter },
+            None => return NavOutcome::LookupFailed,
+        }
+
+        match lookup.last_verse(t, book, chapter) {
+            Some(last_verse)
+                if verse >= 1
+                    && verse <= last_verse
+                    && lookup.verse_exists(t, book, chapter, verse) => {}
+            Some(last_verse) => return NavOutcome::VerseOutOfRange { last_verse },
+            None => return NavOutcome::LookupFailed,
+        }
+
+        match VersePosition::new(book, chapter, verse, t.clone(), None) {
+            Ok(pos) => {
+                self.navigate_to(pos, CursorMode::Single);
+                NavOutcome::Moved
+            }
+            Err(_) => NavOutcome::LookupFailed,
+        }
+    }
+
+    /// Relative step by `count` units in `direction` (Bullet V3). Moves as far
+    /// as it can: if it reaches a Bible boundary partway it stops and reports
+    /// [`NavOutcome::Moved`] if it moved at all, else [`NavOutcome::AtBibleBoundary`].
+    /// A `LookupFailed` from any step short-circuits.
+    pub fn step_n(
+        &mut self,
+        lookup: &dyn VerseLookup,
+        unit: crate::voice_nav::NavUnit,
+        direction: crate::voice_nav::NavDirection,
+        count: u16,
+    ) -> NavOutcome {
+        use crate::voice_nav::{NavDirection, NavUnit};
+        let mut moved = false;
+        for _ in 0..count.max(1) {
+            let outcome = match (unit, direction) {
+                (NavUnit::Verse, NavDirection::Forward) => self.next_verse(lookup),
+                (NavUnit::Verse, NavDirection::Backward) => self.previous_verse(lookup),
+                (NavUnit::Chapter, dir) => self.step_one_chapter(lookup, dir),
+            };
+            match outcome {
+                NavOutcome::Moved => moved = true,
+                NavOutcome::AtBibleBoundary => break,
+                other => return other,
+            }
+        }
+        if moved {
+            NavOutcome::Moved
+        } else {
+            NavOutcome::AtBibleBoundary
+        }
+    }
+
+    /// Move one chapter forward/backward, landing on the first existing verse of
+    /// the target chapter (crossing book boundaries like verse navigation does).
+    fn step_one_chapter(
+        &mut self,
+        lookup: &dyn VerseLookup,
+        direction: crate::voice_nav::NavDirection,
+    ) -> NavOutcome {
+        use crate::voice_nav::NavDirection;
+        let p = self.position.clone();
+        let step = match direction {
+            NavDirection::Forward => compute_chapter_next(lookup, &p.translation, p.book, p.chapter),
+            NavDirection::Backward => {
+                compute_chapter_prev(lookup, &p.translation, p.book, p.chapter)
+            }
+        };
+        self.apply_step(step, "chapter")
+    }
+
     fn apply_step(&mut self, step: Result<(u8, u16, u16), NavError>, dir: &str) -> NavOutcome {
         match step {
             Ok((book, chapter, verse)) => {
@@ -251,7 +344,7 @@ impl CursorState {
 pub const OMISSION_MAX_RETRIES: u16 = 3;
 
 /// Result of a bounds-checked navigation step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NavOutcome {
     /// The cursor moved to a new verse.
     Moved,
@@ -259,6 +352,13 @@ pub enum NavOutcome {
     AtBibleBoundary,
     /// Could not resolve an existing verse (omission retries exhausted).
     LookupFailed,
+    /// An absolute chapter jump named a chapter past the book's last (no move).
+    /// `last_chapter` is the highest chapter in the current book/translation.
+    ChapterOutOfRange { last_chapter: u16 },
+    /// An absolute verse jump named a verse that does not exist in the current
+    /// chapter/translation (past the end, or an omitted verse) — no move.
+    /// `last_verse` is the highest verse in that chapter.
+    VerseOutOfRange { last_verse: u16 },
 }
 
 /// Verse-existence oracle for navigation bounds. The app implements this over
@@ -347,6 +447,68 @@ fn compute_prev(
         }
     }
     // 4. Start of the Bible.
+    Err(NavError::AtBibleBoundary)
+}
+
+/// Next chapter forward, landing on its first existing verse; crosses into the
+/// next book at the end of the current one. (Bullet V3 chapter stepping.)
+fn compute_chapter_next(
+    lookup: &dyn VerseLookup,
+    t: &str,
+    book: u8,
+    chapter: u16,
+) -> Result<(u8, u16, u16), NavError> {
+    // 1. Next chapter within the current book.
+    if let Some(lc) = lookup.last_chapter(t, book) {
+        if chapter < lc {
+            let nc = chapter + 1;
+            if let Some(last) = lookup.last_verse(t, book, nc) {
+                if let Some(v) = first_existing_up(lookup, t, book, nc, 1, last) {
+                    return Ok((book, nc, v));
+                }
+            }
+        }
+    }
+    // 2. First chapter of the next book.
+    if book < 66 {
+        let nb = book + 1;
+        if let Some(last) = lookup.last_verse(t, nb, 1) {
+            if let Some(v) = first_existing_up(lookup, t, nb, 1, 1, last) {
+                return Ok((nb, 1, v));
+            }
+        }
+    }
+    Err(NavError::AtBibleBoundary)
+}
+
+/// Previous chapter, landing on its first existing verse; crosses into the last
+/// chapter of the previous book at the start of the current one.
+fn compute_chapter_prev(
+    lookup: &dyn VerseLookup,
+    t: &str,
+    book: u8,
+    chapter: u16,
+) -> Result<(u8, u16, u16), NavError> {
+    // 1. Previous chapter within the current book.
+    if chapter > 1 {
+        let pc = chapter - 1;
+        if let Some(last) = lookup.last_verse(t, book, pc) {
+            if let Some(v) = first_existing_up(lookup, t, book, pc, 1, last) {
+                return Ok((book, pc, v));
+            }
+        }
+    }
+    // 2. Last chapter of the previous book.
+    if book > 1 {
+        let pb = book - 1;
+        if let Some(lc) = lookup.last_chapter(t, pb) {
+            if let Some(last) = lookup.last_verse(t, pb, lc) {
+                if let Some(v) = first_existing_up(lookup, t, pb, lc, 1, last) {
+                    return Ok((pb, lc, v));
+                }
+            }
+        }
+    }
     Err(NavError::AtBibleBoundary)
 }
 
@@ -609,5 +771,137 @@ mod tests {
         assert_eq!(c.mode(), CursorMode::Single);
         c.back(); // back to the range position → mode derived as Range
         assert_eq!(c.mode(), CursorMode::Range);
+    }
+
+    // ---- V3: absolute jump (jump_to) ----
+
+    use crate::voice_nav::{NavDirection, NavUnit};
+
+    #[test]
+    fn jump_to_verse_in_current_chapter() {
+        let mut c = cursor_at(1, 1, 1); // Genesis 1:1
+        assert_eq!(c.jump_to(&mock_bible(), None, Some(10)), NavOutcome::Moved);
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (1, 1, 10));
+    }
+
+    #[test]
+    fn jump_to_chapter_lands_on_verse_one() {
+        let mut c = cursor_at(1, 1, 5); // Genesis 1:5
+        assert_eq!(c.jump_to(&mock_bible(), Some(2), None), NavOutcome::Moved);
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (1, 2, 1)); // Genesis 2:1
+    }
+
+    #[test]
+    fn jump_to_chapter_and_verse() {
+        let mut c = cursor_at(1, 1, 1);
+        assert_eq!(
+            c.jump_to(&mock_bible(), Some(2), Some(5)),
+            NavOutcome::Moved
+        );
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (1, 2, 5)); // Genesis 2:5
+    }
+
+    #[test]
+    fn jump_to_nonexistent_verse_reports_range() {
+        let mut c = cursor_at(1, 1, 1); // Genesis 1 has 31 verses
+        assert_eq!(
+            c.jump_to(&mock_bible(), None, Some(99)),
+            NavOutcome::VerseOutOfRange { last_verse: 31 }
+        );
+        // cursor unchanged
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (1, 1, 1));
+    }
+
+    #[test]
+    fn jump_to_omitted_verse_reports_range() {
+        let mut c = cursor_at(41, 7, 1); // Mark 7, v16 omitted, last verse 37
+        assert_eq!(
+            c.jump_to(&mock_bible(), None, Some(16)),
+            NavOutcome::VerseOutOfRange { last_verse: 37 }
+        );
+    }
+
+    #[test]
+    fn jump_to_nonexistent_chapter_reports_range() {
+        let mut c = cursor_at(1, 1, 1); // Genesis has 50 chapters
+        assert_eq!(
+            c.jump_to(&mock_bible(), Some(99), None),
+            NavOutcome::ChapterOutOfRange { last_chapter: 50 }
+        );
+    }
+
+    // ---- V3: relative step by N (step_n) ----
+
+    #[test]
+    fn step_n_verses_forward() {
+        let mut c = cursor_at(1, 1, 1);
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Verse, NavDirection::Forward, 3),
+            NavOutcome::Moved
+        );
+        assert_eq!(c.position().verse, 4); // 1 → 4
+    }
+
+    #[test]
+    fn step_n_verses_backward() {
+        let mut c = cursor_at(1, 1, 5);
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Verse, NavDirection::Backward, 2),
+            NavOutcome::Moved
+        );
+        assert_eq!(c.position().verse, 3); // 5 → 3
+    }
+
+    #[test]
+    fn step_n_verses_cross_chapter() {
+        let mut c = cursor_at(1, 1, 30); // Genesis 1:30 (ch has 31 verses)
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Verse, NavDirection::Forward, 3),
+            NavOutcome::Moved
+        );
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (1, 2, 2)); // 30→31→2:1→2:2
+    }
+
+    #[test]
+    fn step_n_partial_then_boundary_still_moved() {
+        let mut c = cursor_at(1, 1, 2);
+        // back 5 verses: 2→1 then boundary; moved at least once → Moved.
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Verse, NavDirection::Backward, 5),
+            NavOutcome::Moved
+        );
+        assert_eq!(c.position().verse, 1);
+    }
+
+    #[test]
+    fn step_n_chapters_both_directions() {
+        let mut c = cursor_at(1, 1, 5);
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Chapter, NavDirection::Forward, 1),
+            NavOutcome::Moved
+        );
+        assert_eq!((c.position().chapter, c.position().verse), (2, 1)); // Genesis 2:1
+
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Chapter, NavDirection::Backward, 1),
+            NavOutcome::Moved
+        );
+        assert_eq!((c.position().chapter, c.position().verse), (1, 1)); // back to Genesis 1:1
+    }
+
+    #[test]
+    fn step_n_chapter_blocked_at_bible_end() {
+        let mut c = cursor_at(66, 22, 21); // Revelation 22 (last chapter)
+        assert_eq!(
+            c.step_n(&mock_bible(), NavUnit::Chapter, NavDirection::Forward, 1),
+            NavOutcome::AtBibleBoundary
+        );
+        let p = c.position();
+        assert_eq!((p.book, p.chapter, p.verse), (66, 22, 21)); // unchanged
     }
 }

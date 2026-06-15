@@ -11,6 +11,7 @@ pub mod reading_mode;
 pub mod context;
 pub mod priming;
 pub mod quotation;
+pub mod voice_nav;
 
 pub use types::*;
 pub use error::*;
@@ -31,6 +32,7 @@ pub use reading_mode::{ReadingMode, ReadingAdvance};
 pub use context::SermonContext;
 pub use priming::PrimingIndex;
 pub use quotation::QuotationMatcher;
+pub use voice_nav::{parse_nav_command, parse_number, NavCommand, NavDirection, NavUnit};
 
 #[cfg(feature = "onnx")]
 pub use semantic::onnx_embedder::OnnxEmbedder;

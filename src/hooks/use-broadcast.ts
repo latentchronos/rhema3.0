@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core"
 import { useBroadcastStore } from "@/stores/broadcast-store"
 import { useBibleStore } from "@/stores/bible-store"
+import { pushToast } from "@/stores/toast-store"
 import { acquireOperatorLock } from "@/lib/operator-lock"
 import type { ChannelVerse, VerseRenderData } from "@/types"
 import type { Verse } from "@/types"
@@ -13,6 +14,30 @@ interface NavVerse {
   text: string
   reference: string
 }
+
+/**
+ * Structured voice navigation command emitted by the backend on `voice_command`
+ * (Bullet V5). Mirrors `rhema_detection::NavCommand`'s serde-tagged JSON.
+ */
+export type NavCommand =
+  | { kind: "step"; unit: "verse" | "chapter"; direction: "forward" | "backward"; count: number }
+  | { kind: "jump_verse"; verse: number }
+  | { kind: "jump_chapter"; chapter: number }
+  | { kind: "jump_chapter_verse"; chapter: number; verse: number }
+  | { kind: "clear" }
+
+/** Result of a `go_to_reference` / `step_verses` command (Bullet V4). */
+export type NavCommandResult =
+  | { status: "moved"; verse: NavVerse }
+  | { status: "no_change" }
+  | { status: "chapter_out_of_range"; book_name: string; requested: number; last_chapter: number }
+  | {
+      status: "verse_out_of_range"
+      book_name: string
+      chapter: number
+      requested: number
+      last_verse: number
+    }
 
 export function toVerseRenderData(verse: Verse, translation: string): VerseRenderData {
   return {
@@ -89,10 +114,25 @@ export async function stepLiveVerse(forward: boolean): Promise<void> {
   const cmd = forward ? "next_verse" : "previous_verse"
   const nav = await invoke<NavVerse | null>(cmd).catch(() => null)
   if (!nav) return
+  commitNavVerse(nav)
+}
+
+/** The active translation abbreviation, defaulting to KJV. */
+function currentTranslation(): string {
   const bible = useBibleStore.getState()
-  const translation =
+  return (
     bible.translations.find((t) => t.id === bible.activeTranslationId)
       ?.abbreviation ?? "KJV"
+  )
+}
+
+/**
+ * Commit a backend-resolved `NavVerse` live. Keeps selection in lockstep with
+ * the cursor/display (Bug A fix): otherwise the Live panel's effect (keyed on
+ * selectedVerse) can re-seed the cursor back to the original verse, so
+ * navigation appears to stop after one step.
+ */
+function commitNavVerse(nav: NavVerse): void {
   const verse: Verse = {
     id: 0,
     translation_id: 1,
@@ -103,11 +143,78 @@ export async function stepLiveVerse(forward: boolean): Promise<void> {
     verse: nav.verse,
     text: nav.text,
   }
-  // Bug A fix: keep selection in lockstep with the cursor/display. Otherwise the
-  // Live panel's effect (keyed on selectedVerse) can re-seed the cursor back to
-  // the original verse, so navigation appears to stop after one step.
-  bible.selectVerse(verse)
-  commitLiveVerse(verse, translation)
+  useBibleStore.getState().selectVerse(verse)
+  commitLiveVerse(verse, currentTranslation())
+}
+
+/** Surface an out-of-range / moved outcome from a navigation command. */
+function handleNavResult(result: NavCommandResult): void {
+  switch (result.status) {
+    case "moved":
+      commitNavVerse(result.verse)
+      break
+    case "verse_out_of_range":
+      pushToast(
+        `${result.book_name} ${result.chapter} has ${result.last_verse} verses — verse ${result.requested} doesn't exist.`,
+        "warn"
+      )
+      break
+    case "chapter_out_of_range":
+      pushToast(
+        `${result.book_name} has ${result.last_chapter} chapters — chapter ${result.requested} doesn't exist.`,
+        "warn"
+      )
+      break
+    case "no_change":
+      break
+  }
+}
+
+/**
+ * Apply a structured voice navigation command (Bullet V6): absolute jumps and
+ * relative steps go through the backend cursor (validated against the active
+ * translation) and commit live; "clear" blanks the output. The operator lock is
+ * acquired first so a voice command beats a stale detection.
+ */
+export async function applyVoiceNavCommand(cmd: NavCommand): Promise<void> {
+  if (cmd.kind === "clear") {
+    acquireOperatorLock()
+    const s = useBroadcastStore.getState()
+    s.setLive(false)
+    commitLiveVerse(null, currentTranslation())
+    return
+  }
+
+  acquireOperatorLock()
+  let result: NavCommandResult | null = null
+  switch (cmd.kind) {
+    case "step":
+      result = await invoke<NavCommandResult>("step_verses", {
+        unit: cmd.unit,
+        direction: cmd.direction,
+        count: cmd.count,
+      }).catch(() => null)
+      break
+    case "jump_verse":
+      result = await invoke<NavCommandResult>("go_to_reference", {
+        chapter: null,
+        verse: cmd.verse,
+      }).catch(() => null)
+      break
+    case "jump_chapter":
+      result = await invoke<NavCommandResult>("go_to_reference", {
+        chapter: cmd.chapter,
+        verse: null,
+      }).catch(() => null)
+      break
+    case "jump_chapter_verse":
+      result = await invoke<NavCommandResult>("go_to_reference", {
+        chapter: cmd.chapter,
+        verse: cmd.verse,
+      }).catch(() => null)
+      break
+  }
+  if (result) handleNavResult(result)
 }
 
 export const broadcastActions = {
