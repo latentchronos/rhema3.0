@@ -9,11 +9,15 @@ import { SettingsDialog } from "@/components/settings-dialog"
 import { ThemeDesigner } from "@/components/broadcast/theme-designer"
 import { BroadcastSettings } from "@/components/broadcast/broadcast-settings"
 import { RoutingModeToggle } from "@/components/controls/routing-mode-toggle"
+import { SessionControl } from "@/components/controls/session-control"
+import { DeviceHealthIndicator } from "@/components/controls/device-health-indicator"
+import { SermonNotesDialog } from "@/components/broadcast/sermon-notes-dialog"
 import { useAudioStore, useTranscriptStore, useBroadcastStore } from "@/stores"
 
 export function TransportBar() {
   const audioLevel = useAudioStore((s) => s.level)
   const isTranscribing = useTranscriptStore((s) => s.isTranscribing)
+  const degradedMode = useTranscriptStore((s) => s.degradedMode)
   const [broadcastOpen, setBroadcastOpen] = useState(false)
 
   return (
@@ -21,7 +25,7 @@ export function TransportBar() {
       data-slot="transport-bar"
       className="col-span-4 flex h-14 items-center justify-between border-b border-border  bg-card px-3"
     >
-      {/* Left: Logo + Plan Badge */}
+      {/* Left: Logo + Plan Badge + Session control */}
       <div className="flex items-center gap-2.5">
         <span className="text-sm font-semibold tracking-tight text-foreground">
           Rhema
@@ -29,6 +33,16 @@ export function TransportBar() {
         <Badge variant="outline" className="text-[0.5625rem] uppercase">
           Free
         </Badge>
+        <SessionControl />
+        {degradedMode && (
+          <Badge
+            variant="destructive"
+            className="text-[0.5625rem] uppercase"
+            title="WebSocket dropped to slower REST transcription"
+          >
+            Degraded (REST)
+          </Badge>
+        )}
       </div>
 
       {/* Center: Session Timer */}
@@ -36,7 +50,9 @@ export function TransportBar() {
 
       {/* Right: Audio + Status + Settings */}
       <div className="flex items-center gap-3">
+        <DeviceHealthIndicator />
         <RoutingModeToggle />
+        <SermonNotesDialog />
         <div className="flex items-center gap-2">
           <MicIcon className="size-3.5 text-muted-foreground" />
           <LevelMeter level={audioLevel.rms} bars={4} />

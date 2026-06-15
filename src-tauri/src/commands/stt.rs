@@ -39,12 +39,16 @@ pub async fn start_transcription(
     vad_enabled: Option<bool>,
 ) -> Result<(), String> {
     // ── 1. Guard: already running? ──────────────────────────────────────
-    let (stt_active, audio_active) = {
+    let (stt_active, audio_active, session_active) = {
         let app_state = state.lock().map_err(|e| e.to_string())?;
         if app_state.stt_active.load(Ordering::Relaxed) {
             return Err("Transcription is already running".into());
         }
-        (app_state.stt_active.clone(), app_state.audio_active.clone())
+        (
+            app_state.stt_active.clone(),
+            app_state.audio_active.clone(),
+            app_state.session_active.clone(),
+        )
     };
 
     // Resolve API key: use provided key, or fall back to DEEPGRAM_API_KEY env var
@@ -331,6 +335,7 @@ pub async fn start_transcription(
     let (partial_tx, mut partial_rx) = tokio::sync::mpsc::channel::<String>(8);
     let (final_tx, mut final_rx) = tokio::sync::mpsc::channel::<FinalJob>(256);
     let det_app = app.clone();
+    let det_session = session_active.clone();
     tauri::async_runtime::spawn(async move {
         // Sentence buffer accumulates is_final fragments into complete sentences.
         // Flushes on sentence-ending punctuation or speech_final signal.
@@ -343,6 +348,12 @@ pub async fn start_transcription(
                 // Finals first — always processed, never starved by partials.
                 final_job = final_rx.recv() => {
                     let Some(job) = final_job else { break };
+                    // Session gate (§2.4): ignore all detection/commands until the
+                    // operator has started the service. Transcript still displays
+                    // (that path is ungated in the consumer).
+                    if !det_session.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     match job {
                         FinalJob::Final { transcript, speech_final } => {
                             if !transcript.is_empty() {
@@ -352,8 +363,12 @@ pub async fn start_transcription(
                                 let direct_found = run_direct_detection(&det_app, &transcript);
                                 // Reading mode: does transcript match expected verse?
                                 check_reading_mode(&det_app, &transcript, direct_found);
-                                // Quotation/semantic only if direct didn't already hit.
+                                // Intent layer (Gap 2): a short voice control command
+                                // ("next verse", "clear screen") drives an action; a
+                                // genuinely-ambiguous command attempt is escalated to
+                                // the Stage-2 fallback. Skipped when direct already hit.
                                 if !direct_found {
+                                    check_voice_command(&det_app, &transcript);
                                     let _ = quotation_tx.try_send(transcript.clone());
                                     if let Some(sentence) = sentence_buf.append(&transcript) {
                                         let _ = semantic_tx.try_send(sentence);
@@ -379,6 +394,9 @@ pub async fn start_transcription(
                 // Partials only when no final is pending. Coalesced under flood.
                 partial = partial_rx.recv() => {
                     let Some(transcript) = partial else { break };
+                    if !det_session.load(Ordering::SeqCst) {
+                        continue;
+                    }
                     // Direct detection on partials — instant feel for verbose
                     // forms like "Psalm chapter 2 verse 3".
                     run_direct_detection(&det_app, &transcript);
@@ -524,6 +542,32 @@ fn emit_detections(
 enum FinalJob {
     Final { transcript: String, speech_final: bool },
     UtteranceEnd,
+}
+
+/// Intent layer, live wiring (Gap 2). Map a short voice control utterance to an
+/// action and emit it to the frontend (`voice_command`); escalate an ambiguous
+/// command attempt to the Stage-2 fallback. Only short, command-like utterances
+/// are considered, so ordinary preaching never triggers navigation.
+fn check_voice_command(app: &AppHandle, transcript: &str) {
+    use rhema_detection::{is_control_command, parse_control_action, ControlAction};
+
+    if let Some(action) = parse_control_action(transcript) {
+        let name = match action {
+            ControlAction::NextVerse => "next",
+            ControlAction::PreviousVerse => "previous",
+            ControlAction::Clear => "clear",
+        };
+        log::info!("voice_command: {name} (from '{transcript}')");
+        let _ = app.emit("voice_command", name);
+    } else if transcript.split_whitespace().count() <= 4 && is_control_command(transcript) {
+        // Command-shaped but unrecognized → genuinely ambiguous; escalate to the
+        // Stage-2 fallback (placeholder until 5.4 wires the real Claude call).
+        let managed: State<'_, Mutex<AppState>> = app.state();
+        let locked = managed.try_lock();
+        if let Ok(state) = locked {
+            state.detection_pipeline.queue_stage2(transcript);
+        }
+    }
 }
 
 fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {

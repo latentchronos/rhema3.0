@@ -28,6 +28,47 @@ pub struct DetectionResult {
     pub transcript_snippet: String,
 }
 
+/// Start the service session (§2.4). Detections, voice commands, and proactive
+/// suggestions are ignored until this is called — so pre-service audio (sound
+/// check, announcements) can't fire false detections. Resets session-scoped
+/// state for a clean service.
+#[tauri::command]
+pub fn start_session(
+    state: State<'_, Mutex<AppState>>,
+    suggestion: State<'_, Mutex<crate::suggestion::SuggestionEngine>>,
+) -> Result<(), String> {
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.session_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.sermon_context.clear_session();
+        s.cursor = None;
+    }
+    if let Ok(mut eng) = suggestion.lock() {
+        eng.clear_session();
+    }
+    log::info!("session: started");
+    Ok(())
+}
+
+/// End the service session. Detections/commands are ignored until restarted.
+#[tauri::command]
+pub fn end_session(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.session_active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    log::info!("session: ended");
+    Ok(())
+}
+
+/// Whether the service session is currently active.
+#[tauri::command]
+pub fn session_status(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(s.session_active
+        .load(std::sync::atomic::Ordering::SeqCst))
+}
+
 /// A verse resolved by a navigation command, for the frontend to project.
 #[derive(Clone, Serialize)]
 pub struct NavVerse {

@@ -2,7 +2,7 @@ import { useRef, useEffect } from "react"
 import { PanelHeader } from "@/components/ui/panel-header"
 import { LevelMeter } from "@/components/ui/level-meter"
 import { Button } from "@/components/ui/button"
-import { MicIcon, MicOffIcon } from "lucide-react"
+import { MicIcon, MicOffIcon, DownloadIcon } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
 import {
   useTranscriptStore,
@@ -33,13 +33,20 @@ export function TranscriptPanel() {
 
   // Connection status events
   useTauriEvent("stt_connected", () => {
-    useTranscriptStore.getState().setConnectionStatus("connected")
+    const t = useTranscriptStore.getState()
+    t.setConnectionStatus("connected")
+    t.setDegradedMode(false) // recovered from any REST fallback
   })
   useTauriEvent("stt_disconnected", () => {
     useTranscriptStore.getState().setConnectionStatus("disconnected")
   })
-  useTauriEvent<string>("stt_error", () => {
-    useTranscriptStore.getState().setConnectionStatus("error")
+  useTauriEvent<string>("stt_error", (msg) => {
+    const t = useTranscriptStore.getState()
+    t.setConnectionStatus("error")
+    // Latch a persistent "degraded" indicator when we drop to REST/Hybrid mode.
+    if (/hybrid|rest/i.test(msg ?? "")) {
+      t.setDegradedMode(true)
+    }
   })
 
   useTauriEvent<{ text: string; is_final: boolean; confidence: number }>(
@@ -182,6 +189,25 @@ export function TranscriptPanel() {
     }
   }
 
+  const exportTranscript = () => {
+    const segs = useTranscriptStore.getState().segments
+    if (segs.length === 0) return
+    const stamp = new Date()
+    const header = `Rhema transcript — exported ${stamp.toLocaleString()}\n${"=".repeat(48)}\n\n`
+    const body = segs.map((s) => s.text).join("\n")
+    const blob = new Blob([header + body + "\n"], {
+      type: "text/plain;charset=utf-8",
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `rhema-transcript-${stamp.toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <div
       data-slot="transcript-panel"
@@ -192,6 +218,16 @@ export function TranscriptPanel() {
         icon={<MicIcon className="size-3" />}
       >
         <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title="Export transcript"
+            aria-label="Export transcript"
+            disabled={segments.length === 0}
+            onClick={exportTranscript}
+          >
+            <DownloadIcon className="size-3.5" />
+          </Button>
           {isTranscribing && (
             <span
               className={`size-2 rounded-full ${

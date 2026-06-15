@@ -20,6 +20,10 @@ pub struct AppState {
     pub active_translation_id: i64,
     pub audio_active: Arc<AtomicBool>,
     pub stt_active: Arc<AtomicBool>,
+    /// Service-session gate (§2.4). Detections/commands are ignored until the
+    /// operator explicitly starts the service, so pre-service audio (sound check,
+    /// announcements) can't fire false detections. Default: NOT started.
+    pub session_active: Arc<AtomicBool>,
     #[allow(dead_code)]
     pub deepgram_api_key: Option<String>,
 }
@@ -37,6 +41,7 @@ impl AppState {
             active_translation_id: 1, // Default to first translation (KJV)
             audio_active: Arc::new(AtomicBool::new(false)),
             stt_active: Arc::new(AtomicBool::new(false)),
+            session_active: Arc::new(AtomicBool::new(false)),
             deepgram_api_key: None,
         }
     }

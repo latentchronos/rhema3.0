@@ -90,9 +90,7 @@ impl SuggestionEngine {
         self.last_suggestion_at = Some(now);
     }
 
-    /// Reset all per-service state (new service). Not yet wired to a session-reset
-    /// command — retained for the forthcoming start/end-session integration.
-    #[allow(dead_code)]
+    /// Reset all per-service state (new service). Called by `start_session`.
     pub fn clear_session(&mut self) {
         self.last_suggestion_at = None;
         self.dismissed.clear();

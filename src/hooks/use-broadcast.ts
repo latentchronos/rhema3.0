@@ -93,19 +93,21 @@ export async function stepLiveVerse(forward: boolean): Promise<void> {
   const translation =
     bible.translations.find((t) => t.id === bible.activeTranslationId)
       ?.abbreviation ?? "KJV"
-  commitLiveVerse(
-    {
-      id: 0,
-      translation_id: 1,
-      book_number: nav.book_number,
-      book_name: nav.book_name,
-      book_abbreviation: "",
-      chapter: nav.chapter,
-      verse: nav.verse,
-      text: nav.text,
-    },
-    translation
-  )
+  const verse: Verse = {
+    id: 0,
+    translation_id: 1,
+    book_number: nav.book_number,
+    book_name: nav.book_name,
+    book_abbreviation: "",
+    chapter: nav.chapter,
+    verse: nav.verse,
+    text: nav.text,
+  }
+  // Bug A fix: keep selection in lockstep with the cursor/display. Otherwise the
+  // Live panel's effect (keyed on selectedVerse) can re-seed the cursor back to
+  // the original verse, so navigation appears to stop after one step.
+  bible.selectVerse(verse)
+  commitLiveVerse(verse, translation)
 }
 
 export const broadcastActions = {

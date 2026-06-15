@@ -155,6 +155,12 @@ impl DetectionPipeline {
         self.stage2_rx.take()
     }
 
+    /// Queue a genuinely-ambiguous utterance for the Stage-2 fallback from the
+    /// live path (Gap 2 wiring). Best-effort; dropped if the receiver is gone.
+    pub fn queue_stage2(&self, text: &str) {
+        let _ = self.stage2_tx.send(text.to_string());
+    }
+
     /// Classify `text` and, if ambiguous, queue it for the Stage-2 fallback.
     fn route_stage2(&self, text: &str, detections: &[MergedDetection]) {
         if self.classify(text, detections) == IntentClass::Ambiguous {
@@ -164,8 +170,40 @@ impl DetectionPipeline {
     }
 }
 
+/// A concrete operator control action parsed from a (short) voice utterance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAction {
+    NextVerse,
+    PreviousVerse,
+    Clear,
+}
+
+/// Map a SHORT, command-like utterance to a concrete navigation/display action.
+///
+/// Conservative on purpose (live-path safety): only utterances of a few words
+/// are considered, so ordinary exposition ("...the next verse says...") never
+/// triggers navigation. Returns `None` for anything longer or unrecognized.
+pub fn parse_control_action(text: &str) -> Option<ControlAction> {
+    let lower = text.to_lowercase();
+    if lower.split_whitespace().count() > CONTROL_WORD_MAX_WORDS + 1 {
+        return None;
+    }
+    if lower.contains("next verse") || lower.contains("go forward") {
+        Some(ControlAction::NextVerse)
+    } else if lower.contains("previous verse")
+        || lower.contains("go back")
+        || lower.contains("previous one")
+    {
+        Some(ControlAction::PreviousVerse)
+    } else if lower.contains("clear") || lower.contains("blank") || lower.contains("hide") {
+        Some(ControlAction::Clear)
+    } else {
+        None
+    }
+}
+
 /// Whether `text` looks like an operational control command (Stage 1).
-fn is_control_command(text: &str) -> bool {
+pub fn is_control_command(text: &str) -> bool {
     let lower = text.to_lowercase();
     if CONTROL_COMMAND_PATTERNS.iter().any(|p| lower.contains(p)) {
         return true;

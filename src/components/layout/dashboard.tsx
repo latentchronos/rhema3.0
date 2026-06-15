@@ -7,10 +7,13 @@ import { SearchPanel } from "@/components/panels/search-panel"
 import { DetectionsPanel } from "@/components/panels/detections-panel"
 import { SuggestionsPanel } from "@/components/panels/suggestions-panel"
 import { useChannels } from "@/hooks/use-channels"
+import { useVoiceCommands } from "@/hooks/use-voice-commands"
 
 export function Dashboard() {
   // Subscribe to the Phase 4 channel events and cache them in the broadcast store.
   useChannels()
+  // Handle backend-emitted voice control commands (next/previous/clear).
+  useVoiceCommands()
 
   return (
     <div
