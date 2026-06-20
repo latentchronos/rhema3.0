@@ -33,13 +33,38 @@ impl DeepgramClient {
     }
 
     /// Build the Deepgram WebSocket URL with query parameters and keyword boosting.
+    ///
+    /// Runtime overrides (default-off, for A/B accent testing — Task 1.3):
+    ///   RHEMA_DG_MODEL    — if set and non-empty, overrides `config.model`
+    ///   RHEMA_DG_LANGUAGE — if set and non-empty, overrides/appends the `language` param
     fn build_url(&self) -> Result<Url, SttError> {
         let mut url = Url::parse("wss://api.deepgram.com/v1/listen")
             .map_err(|e| SttError::ConnectionFailed(e.to_string()))?;
 
+        // Resolve effective model and language, allowing env-var overrides for A/B testing.
+        let effective_model = std::env::var("RHEMA_DG_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.config.model.clone());
+
+        let env_language = std::env::var("RHEMA_DG_LANGUAGE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let effective_language: Option<String> = env_language
+            .clone()
+            .or_else(|| self.config.language.clone());
+
+        log::info!(
+            "Deepgram effective model={} language={:?} (env overrides: RHEMA_DG_MODEL={}, RHEMA_DG_LANGUAGE={})",
+            effective_model,
+            effective_language,
+            std::env::var("RHEMA_DG_MODEL").unwrap_or_else(|_| "(unset)".into()),
+            std::env::var("RHEMA_DG_LANGUAGE").unwrap_or_else(|_| "(unset)".into()),
+        );
+
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("model", &self.config.model);
+            q.append_pair("model", &effective_model);
             q.append_pair("encoding", &self.config.encoding);
             q.append_pair("sample_rate", &self.config.sample_rate.to_string());
             q.append_pair("channels", "1");
@@ -50,7 +75,7 @@ impl DeepgramClient {
             q.append_pair("utterance_end_ms", "1000");
             q.append_pair("vad_events", "true");
 
-            if let Some(ref lang) = self.config.language {
+            if let Some(ref lang) = effective_language {
                 q.append_pair("language", lang);
             }
 
