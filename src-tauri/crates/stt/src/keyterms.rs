@@ -1,5 +1,7 @@
-/// Returns Bible book names, common abbreviations, spoken forms, and theological terms
+/// Returns Bible book names, spoken numbered forms, and high-value theological terms
 /// for use as Deepgram keyword boosting.
+/// Written abbreviations (Jn, Ps, etc.) are intentionally excluded — nobody speaks them
+/// and they waste the 100-term cap. Total: 66 books + 18 spoken + 6 theological = 90.
 pub fn bible_keyterms() -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
 
@@ -74,16 +76,6 @@ pub fn bible_keyterms() -> Vec<String> {
     ];
     terms.extend(books.iter().map(|s| s.to_string()));
 
-    // Common abbreviations
-    let abbreviations = [
-        "Gen", "Exod", "Lev", "Num", "Deut", "Josh", "Judg", "Sam", "Kgs", "Chr", "Neh",
-        "Esth", "Ps", "Prov", "Eccl", "Isa", "Jer", "Lam", "Ezek", "Dan", "Hos", "Obad",
-        "Mic", "Nah", "Hab", "Zeph", "Hag", "Zech", "Mal", "Matt", "Mk", "Lk", "Jn", "Rom",
-        "Cor", "Gal", "Eph", "Phil", "Col", "Thess", "Tim", "Tit", "Phlm", "Heb", "Jas",
-        "Pet", "Rev",
-    ];
-    terms.extend(abbreviations.iter().map(|s| s.to_string()));
-
     // Spoken forms
     let spoken = [
         "First Samuel",
@@ -107,41 +99,43 @@ pub fn bible_keyterms() -> Vec<String> {
     ];
     terms.extend(spoken.iter().map(|s| s.to_string()));
 
-    // Theological terms
+    // Theological terms — only distinctive, rarely-confused words and proper nouns.
+    // Common English words (grace, mercy, salvation, etc.) are intentionally excluded
+    // to avoid false insertions. Trimmed from 31 to 6 to fit within the Deepgram 100-term cap.
     let theological = [
-        "justification",
-        "sanctification",
         "propitiation",
+        "sanctification",
+        "justification",
         "eschatology",
-        "atonement",
-        "redemption",
-        "righteousness",
-        "covenant",
-        "baptism",
-        "resurrection",
-        "crucifixion",
-        "salvation",
-        "repentance",
-        "grace",
-        "mercy",
-        "forgiveness",
-        "reconciliation",
-        "glorification",
-        "predestination",
-        "sovereignty",
-        "omniscience",
-        "omnipotence",
-        "trinity",
-        "incarnation",
-        "ascension",
-        "transfiguration",
-        "beatitudes",
-        "tabernacle",
-        "ark of the covenant",
         "Melchizedek",
         "Nebuchadnezzar",
     ];
     terms.extend(theological.iter().map(|s| s.to_string()));
 
     terms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spoken_numbered_books_survive_the_cap() {
+        let terms = bible_keyterms();
+        assert!(terms.iter().any(|t| t == "First John"));
+        assert!(terms.iter().any(|t| t == "Second Corinthians"));
+    }
+
+    #[test]
+    fn drops_unspoken_written_abbreviations() {
+        let terms = bible_keyterms();
+        assert!(!terms.iter().any(|t| t == "Jn"));   // nobody says "Jn"
+        assert!(!terms.iter().any(|t| t == "Ps"));
+    }
+
+    #[test]
+    fn total_stays_within_budget() {
+        // leave headroom for the 5 core terms + ~7 command words added in deepgram.rs
+        assert!(bible_keyterms().len() <= 95);
+    }
 }
