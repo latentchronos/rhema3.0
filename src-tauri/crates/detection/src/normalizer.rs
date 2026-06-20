@@ -1,4 +1,4 @@
-//! Phonetic transcript normalization (Phase 2, Bullet 2.1).
+//! Phonetic transcript normalization (Phase 2, Bullet 2.1; Phase 4, Task 4.2).
 //!
 //! STT output is treated as potentially corrupted input. This is a pure,
 //! stateless pre-processing pass applied to the raw transcript *before* entity
@@ -26,6 +26,45 @@
 //!
 //! The rule set is data-driven (static arrays), so it is testable and
 //! extensible without touching logic.
+
+use std::sync::OnceLock;
+use crate::scripture_phonetic::ScriptureCorrector;
+
+/// Returns the process-wide `ScriptureCorrector`, built exactly once.
+fn corrector() -> &'static ScriptureCorrector {
+    static CORRECTOR: OnceLock<ScriptureCorrector> = OnceLock::new();
+    CORRECTOR.get_or_init(ScriptureCorrector::new)
+}
+
+/// Returns `true` when the token at position `i` within `tokens` is in a
+/// scripture-plausible context: a number-word is adjacent, or the immediately
+/// preceding token is "of" or "book".
+fn correction_context_allows(tokens: &[&str], i: usize) -> bool {
+    let is_num = |t: &str| crate::voice_nav::parse_number(t).is_some();
+    if i > 0 && is_num(tokens[i - 1]) {
+        return true;
+    }
+    if i + 1 < tokens.len() && is_num(tokens[i + 1]) {
+        return true;
+    }
+    let prev = if i > 0 { Some(tokens[i - 1].to_ascii_lowercase()) } else { None };
+    matches!(prev.as_deref(), Some("of") | Some("book"))
+}
+
+/// Apply context-gated phonetic correction of scripture names. Each token is
+/// passed to the process-wide `ScriptureCorrector`; if it returns `Some(canonical)`
+/// the token is replaced, otherwise it is kept as-is.
+fn apply_scripture_correction(tokens: &[&str]) -> Vec<String> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, &tok)| {
+            corrector()
+                .correct_token(tok, correction_context_allows(tokens, i))
+                .unwrap_or_else(|| tok.to_string())
+        })
+        .collect()
+}
 
 /// Ordered homophone substitution rules: `(lowercased input token sequence,
 /// canonical replacement)`. Multi-token patterns (e.g. spelled-out acronyms)
@@ -76,7 +115,11 @@ pub fn normalize_transcript(input: &str) -> String {
     if tokens.is_empty() {
         return String::new();
     }
-    let after_homophones = apply_homophones(&tokens);
+    // Phase 4 (Task 4.2): context-gated phonetic correction runs first so
+    // mangled scripture names are canonical before the homophone table sees them.
+    let corrected = apply_scripture_correction(&tokens);
+    let corrected_refs: Vec<&str> = corrected.iter().map(String::as_str).collect();
+    let after_homophones = apply_homophones(&corrected_refs);
     let after_ordinals = apply_ordinal_prefixes(&after_homophones);
     after_ordinals.join(" ")
 }
@@ -239,5 +282,17 @@ mod tests {
     fn empty_input_is_empty() {
         assert_eq!(normalize_transcript(""), "");
         assert_eq!(normalize_transcript("   "), "");
+    }
+
+    #[test]
+    fn corrects_scripture_name_in_context() {
+        let out = normalize_transcript("turn to habakuk three");
+        assert!(out.contains("Habakkuk"), "expected correction, got: {out}");
+    }
+
+    #[test]
+    fn leaves_common_word_uncorrected() {
+        // "mark" is a stoplisted common word — must never be 'corrected' to the book Mark.
+        assert_eq!(normalize_transcript("please mark this day"), "please mark this day");
     }
 }
