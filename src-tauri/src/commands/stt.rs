@@ -231,7 +231,7 @@ pub async fn start_transcription(
     let rest_event_tx = event_tx.clone();
     let rest_config = stt_config.clone();
     tauri::async_runtime::spawn(async move {
-        let result = client.connect(deepgram_rx.clone(), event_tx).await;
+        let result = client.connect(deepgram_rx.clone(), event_tx, conn_active.clone()).await;
         if let Err(e) = result {
             log::error!("Deepgram WebSocket failed: {e}");
 
@@ -1330,15 +1330,10 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
 #[tauri::command]
 pub fn stop_transcription(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
     let app_state = state.lock().map_err(|e| e.to_string())?;
-
-    if !app_state.stt_active.load(Ordering::Relaxed) {
-        return Err("Transcription is not running".into());
-    }
-
-    // Setting these flags causes the background threads/tasks to exit.
+    // Idempotent: always reset, even if a dropped connection already cleared
+    // the flag, so the user can always recover the UI without killing the app.
     app_state.stt_active.store(false, Ordering::SeqCst);
     app_state.audio_active.store(false, Ordering::SeqCst);
-
     log::info!("Transcription stop requested");
     Ok(())
 }
