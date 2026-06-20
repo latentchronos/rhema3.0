@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 use crate::error::SttError;
-use crate::keyterms::bible_keyterms;
+use crate::keyterms::{bible_keyterms, command_keyterms};
 use crate::types::{SttConfig, TranscriptEvent, Word};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
@@ -88,12 +88,13 @@ impl DeepgramClient {
                 "Lord".to_string(),
                 "Holy Spirit".to_string(),
             ];
+            let command_terms = command_keyterms();
             let bible_terms = bible_keyterms();
 
-            // Deduplicate: core terms first, then bible_keyterms(), capped at 100.
+            // Deduplicate: core → command → bible, capped at 100.
             let mut seen = std::collections::HashSet::new();
             let mut all_keyterms: Vec<String> = Vec::new();
-            for term in core_terms.into_iter().chain(bible_terms.into_iter()) {
+            for term in core_terms.into_iter().chain(command_terms.into_iter()).chain(bible_terms.into_iter()) {
                 if seen.insert(term.clone()) {
                     all_keyterms.push(term);
                 }
@@ -101,6 +102,7 @@ impl DeepgramClient {
                     break;
                 }
             }
+            debug_assert!(all_keyterms.len() <= 100, "keyterm budget exceeded: {}", all_keyterms.len());
 
             for term in &all_keyterms {
                 q.append_pair("keyterm", term);

@@ -1,7 +1,14 @@
+/// Reserved voice-command words, boosted so Deepgram transcribes them
+/// correctly across accents at the source (moderate boost, sermon-context safe).
+pub fn command_keyterms() -> Vec<String> {
+    ["verse", "chapter", "next", "previous", "forward", "back", "clear"]
+        .iter().map(|s| s.to_string()).collect()
+}
+
 /// Returns Bible book names, spoken numbered forms, and high-value theological terms
 /// for use as Deepgram keyword boosting.
 /// Written abbreviations (Jn, Ps, etc.) are intentionally excluded — nobody speaks them
-/// and they waste the 100-term cap. Total: 66 books + 18 spoken + 6 theological = 90.
+/// and they waste the 100-term cap. Total: 66 books + 18 spoken + 4 theological = 88.
 pub fn bible_keyterms() -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
 
@@ -101,12 +108,11 @@ pub fn bible_keyterms() -> Vec<String> {
 
     // Theological terms — only distinctive, rarely-confused words and proper nouns.
     // Common English words (grace, mercy, salvation, etc.) are intentionally excluded
-    // to avoid false insertions. Trimmed from 31 to 6 to fit within the Deepgram 100-term cap.
+    // to avoid false insertions. Trimmed to 4 to fit within the Deepgram 100-term cap
+    // (budget: 5 core + 7 command + 88 bible = 100; removed "justification" and "eschatology").
     let theological = [
         "propitiation",
         "sanctification",
-        "justification",
-        "eschatology",
         "Melchizedek",
         "Nebuchadnezzar",
     ];
@@ -135,7 +141,21 @@ mod tests {
 
     #[test]
     fn total_stays_within_budget() {
-        // leave headroom for the 5 core terms + ~7 command words added in deepgram.rs
+        // 66 books + 18 spoken + 4 theological = 88; leave headroom for 5 core + 7 command in deepgram.rs
         assert!(bible_keyterms().len() <= 95);
+    }
+
+    #[test]
+    fn command_words_are_boosted() {
+        let terms = command_keyterms();
+        for w in ["verse", "chapter", "next", "previous", "forward", "clear"] {
+            assert!(terms.iter().any(|t| t == w), "missing {w}");
+        }
+    }
+
+    #[test]
+    fn full_keyterm_budget_fits_under_cap() {
+        // 5 core (added in deepgram.rs) + command + bible must not exceed Deepgram's 100 cap.
+        assert!(5 + command_keyterms().len() + bible_keyterms().len() <= 100);
     }
 }
