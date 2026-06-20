@@ -14,6 +14,8 @@ pub mod context;
 pub mod priming;
 pub mod quotation;
 pub mod voice_nav;
+pub mod textutil;
+pub mod scripture_phonetic;
 
 pub use types::*;
 pub use error::*;

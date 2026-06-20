@@ -10,6 +10,7 @@ log.workspace = true
 thiserror.workspace = true
 aho-corasick = "1"
 lru = "0.12"
+rphonetic = { version = "3.0.6", features = ["embedded_dm"] }
 # Stage-2 fallback channel only (no runtime/spawn in this crate — the app owns that).
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
