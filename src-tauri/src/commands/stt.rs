@@ -192,7 +192,9 @@ pub async fn start_transcription(
                                 None => {}
                             }
                         }
-                        let _ = deepgram_tx.try_send(frame.samples);
+                        if deepgram_tx.try_send(frame.samples).is_err() {
+                            rhema_detection::metrics::log_channel_drop("deepgram");
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -369,9 +371,13 @@ pub async fn start_transcription(
                                 // the Stage-2 fallback. Skipped when direct already hit.
                                 if !direct_found {
                                     check_voice_command(&det_app, &transcript);
-                                    let _ = quotation_tx.try_send(transcript.clone());
+                                    if quotation_tx.try_send(transcript.clone()).is_err() {
+                                        rhema_detection::metrics::log_channel_drop("quotation");
+                                    }
                                     if let Some(sentence) = sentence_buf.append(&transcript) {
-                                        let _ = semantic_tx.try_send(sentence);
+                                        if semantic_tx.try_send(sentence).is_err() {
+                                            rhema_detection::metrics::log_channel_drop("semantic");
+                                        }
                                     }
                                 } else {
                                     sentence_buf.force_flush();
@@ -379,13 +385,17 @@ pub async fn start_transcription(
                             }
                             if speech_final {
                                 if let Some(sentence) = sentence_buf.force_flush() {
-                                    let _ = semantic_tx.try_send(sentence);
+                                    if semantic_tx.try_send(sentence).is_err() {
+                                        rhema_detection::metrics::log_channel_drop("semantic");
+                                    }
                                 }
                             }
                         }
                         FinalJob::UtteranceEnd => {
                             if let Some(sentence) = sentence_buf.force_flush() {
-                                let _ = semantic_tx.try_send(sentence);
+                                if semantic_tx.try_send(sentence).is_err() {
+                                    rhema_detection::metrics::log_channel_drop("semantic");
+                                }
                             }
                         }
                     }
@@ -435,7 +445,9 @@ pub async fn start_transcription(
                             );
                             last_partial_emit = std::time::Instant::now();
                         }
-                        let _ = partial_tx.try_send(transcript);
+                        if partial_tx.try_send(transcript).is_err() {
+                            rhema_detection::metrics::log_channel_drop("partial");
+                        }
                     }
                 }
                 TranscriptEvent::Final {
@@ -455,13 +467,17 @@ pub async fn start_transcription(
                             },
                         );
                     }
-                    let _ = final_tx.try_send(FinalJob::Final {
+                    if final_tx.try_send(FinalJob::Final {
                         transcript,
                         speech_final,
-                    });
+                    }).is_err() {
+                        rhema_detection::metrics::log_channel_drop("final");
+                    }
                 }
                 TranscriptEvent::UtteranceEnd => {
-                    let _ = final_tx.try_send(FinalJob::UtteranceEnd);
+                    if final_tx.try_send(FinalJob::UtteranceEnd).is_err() {
+                        rhema_detection::metrics::log_channel_drop("final");
+                    }
                 }
                 TranscriptEvent::SpeechStarted => {
                     let _ = event_app.emit("stt_speech_started", ());
@@ -552,7 +568,12 @@ enum FinalJob {
 fn check_voice_command(app: &AppHandle, transcript: &str) {
     use rhema_detection::{is_control_command, parse_nav_command};
 
-    if let Some(cmd) = parse_nav_command(transcript) {
+    let nav = parse_nav_command(transcript);
+    // Metrics: log every command attempt and whether it parsed (observe-only).
+    let parsed_str: Option<String> = nav.as_ref().map(|cmd| format!("{cmd:?}"));
+    rhema_detection::metrics::log_command_attempt(transcript, parsed_str.as_deref());
+
+    if let Some(cmd) = nav {
         // Emit the structured command (jump / step / clear) for the frontend to
         // route through the navigation cursor (Bullet V5).
         log::info!("voice_command: {cmd:?} (from '{transcript}')");
