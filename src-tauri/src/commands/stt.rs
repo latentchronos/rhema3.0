@@ -343,6 +343,13 @@ pub async fn start_transcription(
         // Flushes on sentence-ending punctuation or speech_final signal.
         let mut sentence_buf = rhema_detection::SentenceBuffer::new();
 
+        // Pace-driven adaptive timeout (Task 2.3): track inter-word gap with an
+        // EMA and feed it back into the sentence buffer's flush timeout.
+        let mut pace = rhema_detection::pace::PaceEstimator::new(4.0);
+        let mut last_final_at: Option<std::time::Instant> = None;
+        // Periodic tick to activate the previously dead check_timeout() path.
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
+
         loop {
             tokio::select! {
                 biased;
@@ -357,7 +364,27 @@ pub async fn start_transcription(
                         continue;
                     }
                     match job {
-                        FinalJob::Final { transcript, speech_final } => {
+                        FinalJob::Final { transcript, speech_final, n_words, span_secs } => {
+                            // ── Pace-driven adaptive timeout (Task 2.3) ──────────
+                            // Measure wall-clock gap since the last final, feed the
+                            // EMA estimator, then push the smoothed gap back into
+                            // the sentence buffer so its flush timeout tracks the
+                            // speaker's natural rhythm.
+                            let now = std::time::Instant::now();
+                            let dt = last_final_at.map(|t| now.duration_since(t).as_secs_f64()).unwrap_or(0.0);
+                            last_final_at = Some(now);
+                            pace.observe(n_words, span_secs, dt);
+                            sentence_buf.set_adaptive_timeout(pace.gap_secs());
+                            // Instantaneous gap this fragment (valid only when ≥2 words
+                            // and span ≥ 0.4 s, otherwise 0.0 — mirrors PaceEstimator's
+                            // validity check so the metric is meaningful).
+                            let inst = if n_words >= 2 && span_secs >= 0.4 {
+                                span_secs / (n_words as f64 - 1.0)
+                            } else {
+                                0.0
+                            };
+                            rhema_detection::metrics::log_pace(inst, pace.gap_secs().unwrap_or(0.0));
+                            // ─────────────────────────────────────────────────────
                             if !transcript.is_empty() {
                                 // Translation commands: "read in NIV", "switch to ESV"
                                 check_translation_command(&det_app, &transcript);
@@ -411,6 +438,21 @@ pub async fn start_transcription(
                     // forms like "Psalm chapter 2 verse 3".
                     run_direct_detection(&det_app, &transcript);
                 }
+
+                // Periodic tick: activates the sentence buffer's timeout flush
+                // (previously dead code — check_timeout() was never called).
+                // biased ordering keeps finals highest-priority; the tick fires
+                // only when neither final nor partial is immediately ready.
+                _ = tick.tick() => {
+                    if !det_session.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    if let Some(sentence) = sentence_buf.check_timeout() {
+                        if semantic_tx.try_send(sentence).is_err() {
+                            rhema_detection::metrics::log_channel_drop("semantic");
+                        }
+                    }
+                }
             }
         }
         log::info!("Detection worker task exited");
@@ -454,7 +496,7 @@ pub async fn start_transcription(
                     transcript,
                     confidence,
                     speech_final,
-                    ..
+                    words,
                 } => {
                     if !transcript.is_empty() {
                         // Emit as permanent transcript segment (every is_final)
@@ -467,9 +509,12 @@ pub async fn start_transcription(
                             },
                         );
                     }
+                    let (n_words, span_secs) = word_span(&words);
                     if final_tx.try_send(FinalJob::Final {
                         transcript,
                         speech_final,
+                        n_words,
+                        span_secs,
                     }).is_err() {
                         rhema_detection::metrics::log_channel_drop("final");
                     }
@@ -551,13 +596,72 @@ fn emit_detections(
     crate::channels::route_detections(app, &kept);
 }
 
+/// Compute the word count and time span from a slice of Deepgram word-timing objects.
+///
+/// Returns `(n_words, span_secs)` where `span_secs` is
+/// `last_word.end - first_word.start`. For fewer than 2 words the span is 0.0
+/// (not enough endpoints to measure a gap). Pure / no side-effects — unit-testable.
+fn word_span(words: &[rhema_stt::types::Word]) -> (usize, f64) {
+    let n = words.len();
+    let span = if n >= 2 { words[n - 1].end - words[0].start } else { 0.0 };
+    (n, span)
+}
+
 /// An authoritative (is_final / utterance-end) detection job. Routed on its own
 /// channel, separate from the interim flood, so finals are **never dropped** even
 /// when fast speech saturates the partial channel (fast-speech hardening). The
 /// detection worker drains this channel with priority over partials.
 enum FinalJob {
-    Final { transcript: String, speech_final: bool },
+    Final {
+        transcript: String,
+        speech_final: bool,
+        /// Number of words in this Deepgram-final fragment (from word-timing data).
+        n_words: usize,
+        /// `last_word.end - first_word.start` in seconds; 0.0 when fewer than 2 words.
+        span_secs: f64,
+    },
     UtteranceEnd,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_span_empty() {
+        let (n, span) = word_span(&[]);
+        assert_eq!(n, 0);
+        assert_eq!(span, 0.0);
+    }
+
+    #[test]
+    fn word_span_single() {
+        let w = rhema_stt::types::Word {
+            text: "hello".into(),
+            start: 1.0,
+            end: 1.5,
+            confidence: 1.0,
+            punctuated_word: None,
+        };
+        let (n, span) = word_span(&[w]);
+        assert_eq!(n, 1);
+        assert_eq!(span, 0.0);
+    }
+
+    #[test]
+    fn word_span_three_words() {
+        let make = |start: f64, end: f64| rhema_stt::types::Word {
+            text: "x".into(),
+            start,
+            end,
+            confidence: 1.0,
+            punctuated_word: None,
+        };
+        let words = vec![make(1.0, 1.5), make(2.0, 2.5), make(3.5, 4.0)];
+        let (n, span) = word_span(&words);
+        assert_eq!(n, 3);
+        assert!((span - 3.0).abs() < 1e-9, "expected span=3.0 got {span}");
+    }
 }
 
 /// Intent layer, live wiring (Gap 2 / Bullet V5). Parse a short voice utterance
