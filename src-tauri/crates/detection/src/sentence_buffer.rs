@@ -3,6 +3,9 @@ use std::time::Instant;
 /// Default timeout: flush the buffer if no new text arrives within 3 seconds.
 const DEFAULT_FLUSH_TIMEOUT_MS: u128 = 3000;
 
+/// Maximum word count before forcing a flush (prevents run-on chunks from fast speakers).
+const MAX_WORDS: usize = 20;
+
 /// Accumulates transcript fragments into complete sentences before
 /// passing them to the detection pipeline.
 ///
@@ -42,13 +45,34 @@ impl SentenceBuffer {
         self.buffer.push_str(text);
         self.last_append = Some(Instant::now());
 
-        // Check for sentence-ending punctuation
+        // Check for sentence-ending punctuation (natural boundary — wins over word cap)
         let trimmed = self.buffer.trim_end();
         if trimmed.ends_with('.') || trimmed.ends_with('!') || trimmed.ends_with('?') {
             return Some(self.flush());
         }
 
+        // Safety cap: flush if the buffer has grown beyond MAX_WORDS
+        if self.buffer.split_whitespace().count() >= MAX_WORDS {
+            return Some(self.flush());
+        }
+
         None
+    }
+
+    /// Update the flush timeout based on the speaker's observed inter-word gap.
+    ///
+    /// `gap_secs`: measured silence between words. `None` resets to the warm-up default.
+    /// The computed timeout is `2.5 × gap_secs`, clamped to [800 ms, 5000 ms].
+    pub fn set_adaptive_timeout(&mut self, gap_secs: Option<f64>) {
+        self.flush_timeout_ms = match gap_secs {
+            Some(g) => (2.5 * g * 1000.0).clamp(800.0, 5000.0) as u128,
+            None => DEFAULT_FLUSH_TIMEOUT_MS,
+        };
+    }
+
+    /// Returns the current flush timeout in milliseconds (exposed for testing).
+    pub fn flush_timeout_ms(&self) -> u128 {
+        self.flush_timeout_ms
     }
 
     /// Check if the buffer should be flushed due to timeout.
@@ -143,5 +167,24 @@ mod tests {
         buf.append("Praise the Lord");
         let result = buf.append("for He is good!");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn flushes_at_word_cap() {
+        let mut buf = SentenceBuffer::new();
+        let words = "a ".repeat(25);            // 25 words, no punctuation
+        let out = buf.append(words.trim());
+        assert!(out.is_some(), "should flush at word cap even with no punctuation");
+    }
+
+    #[test]
+    fn adaptive_timeout_is_clamped() {
+        let mut buf = SentenceBuffer::new();
+        buf.set_adaptive_timeout(Some(0.1));    // absurdly fast
+        assert_eq!(buf.flush_timeout_ms(), 800);   // floor
+        buf.set_adaptive_timeout(Some(10.0));   // absurdly slow
+        assert_eq!(buf.flush_timeout_ms(), 5000);  // ceiling
+        buf.set_adaptive_timeout(None);
+        assert_eq!(buf.flush_timeout_ms(), 3000);  // warm-up default
     }
 }
