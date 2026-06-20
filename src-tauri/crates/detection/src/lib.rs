@@ -5,6 +5,7 @@ pub mod normalizer;
 pub mod direct;
 pub mod semantic;
 pub mod merger;
+pub mod metrics;
 pub mod pipeline;
 pub mod sentence_buffer;
 pub mod reading_mode;
