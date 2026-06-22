@@ -405,7 +405,7 @@ pub async fn start_transcription(
                                 // genuinely-ambiguous command attempt is escalated to
                                 // the Stage-2 fallback. Skipped when direct already hit.
                                 if !direct_found {
-                                    if rhema_detection::is_isolated_command_context(&transcript, speech_final) {
+                                    if rhema_detection::is_isolated_command_context(&transcript) {
                                         check_voice_command(&det_app, &transcript, det_wake.as_deref());
                                     }
                                     if quotation_tx.try_send(transcript.clone()).is_err() {
