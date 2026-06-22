@@ -90,6 +90,8 @@ function AudioSection() {
     setGain,
     vadEnabled,
     setVadEnabled,
+    commandWakeWord,
+    setCommandWakeWord,
   } = useSettingsStore()
 
   const [devices, setDevices] = useState<DeviceInfo[]>([])
@@ -229,6 +231,28 @@ function AudioSection() {
         >
           {vadEnabled ? "On" : "Off"}
         </Button>
+      </div>
+
+      {/* Wake word */}
+      <div className="flex flex-col gap-2">
+        <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Voice command wake word (optional)
+        </label>
+        <Input
+          type="text"
+          placeholder="e.g. rhema — leave empty to disable"
+          value={commandWakeWord ?? ""}
+          onChange={(e) => {
+            const v = e.target.value.trim()
+            setCommandWakeWord(v || null)
+          }}
+          className="text-xs"
+        />
+        <p className="text-[0.625rem] leading-relaxed text-muted-foreground">
+          When set, voice navigation commands must be prefixed with this word
+          (e.g. &quot;rhema next verse&quot;). Leave empty to accept commands without a
+          prefix. Disabled by default.
+        </p>
       </div>
     </div>
   )

@@ -370,6 +370,26 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
     })
 }
 
+/// Way 5: optional wake-word gating. When `wake` is Some(non-empty), the command
+/// must begin with that wake word (which is stripped before parsing); otherwise None.
+/// When `wake` is None or empty, this is exactly `parse_nav_command`.
+pub fn parse_nav_command_with_wake(text: &str, wake: Option<&str>) -> Option<NavCommand> {
+    let w = wake.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    match w {
+        None => parse_nav_command(text),
+        Some(w) => {
+            let lower = text.trim().to_lowercase();
+            let rest = lower.strip_prefix(&w)?;
+            // require a word boundary right after the wake word (space or end), so
+            // "rhematic" does not match wake "rhema".
+            if !rest.is_empty() && rest.chars().next().map_or(false, |c| c.is_alphanumeric()) {
+                return None;
+            }
+            parse_nav_command(rest.trim())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +648,24 @@ mod tests {
         assert!(!is_isolated_command_context("", true));            // empty
         assert!(!is_isolated_command_context(
             "and so the next verse really shows us that god is faithful to us", true)); // too long (narration)
+    }
+
+    // ---- parse_nav_command_with_wake (Way 5) ----
+
+    #[test]
+    fn wake_word_passthrough_when_none_or_empty() {
+        use NavDirection::*;
+        use NavUnit::*;
+        assert_eq!(parse_nav_command_with_wake("next verse", None), Some(step(Verse, Forward, 1)));
+        assert_eq!(parse_nav_command_with_wake("next verse", Some("")), Some(step(Verse, Forward, 1)));
+    }
+
+    #[test]
+    fn wake_word_required_when_set() {
+        use NavDirection::*;
+        use NavUnit::*;
+        assert_eq!(parse_nav_command_with_wake("rhema next verse", Some("rhema")), Some(step(Verse, Forward, 1)));
+        assert_eq!(parse_nav_command_with_wake("next verse", Some("rhema")), None); // missing prefix
+        assert_eq!(parse_nav_command_with_wake("rhematic next verse", Some("rhema")), None); // boundary guard
     }
 }

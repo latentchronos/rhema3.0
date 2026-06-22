@@ -37,7 +37,7 @@ pub use reading_mode::{ReadingMode, ReadingAdvance};
 pub use context::SermonContext;
 pub use priming::PrimingIndex;
 pub use quotation::QuotationMatcher;
-pub use voice_nav::{is_isolated_command_context, parse_nav_command, parse_number, NavCommand, NavDirection, NavUnit};
+pub use voice_nav::{is_isolated_command_context, parse_nav_command, parse_nav_command_with_wake, parse_number, NavCommand, NavDirection, NavUnit};
 
 #[cfg(feature = "onnx")]
 pub use semantic::onnx_embedder::OnnxEmbedder;

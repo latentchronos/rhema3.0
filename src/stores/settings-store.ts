@@ -15,6 +15,7 @@ interface SettingsState {
   audioChannelIndex: number | null
   gain: number
   vadEnabled: boolean
+  commandWakeWord: string | null
   autoMode: boolean
   confidenceThreshold: number
   cooldownMs: number
@@ -32,6 +33,7 @@ interface SettingsState {
   setAudioChannelIndex: (id: number | null) => void
   setGain: (gain: number) => void
   setVadEnabled: (enabled: boolean) => void
+  setCommandWakeWord: (word: string | null) => void
   setAutoMode: (auto: boolean) => void
   setConfidenceThreshold: (threshold: number) => void
   setCooldownMs: (ms: number) => void
@@ -51,6 +53,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   audioChannelIndex: null,
   gain: 1.0,
   vadEnabled: false,
+  commandWakeWord: null,
   autoMode: false,
   confidenceThreshold: 0.8,
   cooldownMs: 2500,
@@ -68,6 +71,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setAudioChannelIndex: (audioChannelIndex) => set({ audioChannelIndex }),
   setGain: (gain) => set({ gain }),
   setVadEnabled: (vadEnabled) => set({ vadEnabled }),
+  setCommandWakeWord: (commandWakeWord) => set({ commandWakeWord }),
   setAutoMode: (autoMode) => set({ autoMode }),
   setConfidenceThreshold: (confidenceThreshold) => set({ confidenceThreshold }),
   setCooldownMs: (cooldownMs) => set({ cooldownMs }),

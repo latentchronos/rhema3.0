@@ -37,6 +37,7 @@ pub async fn start_transcription(
     gain: Option<f32>,
     channel_index: Option<u16>,
     vad_enabled: Option<bool>,
+    command_wake_word: Option<String>,
 ) -> Result<(), String> {
     // ── 1. Guard: already running? ──────────────────────────────────────
     let (stt_active, audio_active, session_active) = {
@@ -66,12 +67,13 @@ pub async fn start_transcription(
     }
 
     log::info!(
-        "Starting transcription: api_key={}..., device_id={:?}, gain={:?}, channel_index={:?}, vad_enabled={:?}",
+        "Starting transcription: api_key={}..., device_id={:?}, gain={:?}, channel_index={:?}, vad_enabled={:?}, command_wake_word={:?}",
         &resolved_api_key[..8.min(resolved_api_key.len())],
         device_id,
         gain,
         channel_index,
-        vad_enabled
+        vad_enabled,
+        command_wake_word
     );
 
     stt_active.store(true, Ordering::SeqCst);
@@ -91,6 +93,10 @@ pub async fn start_transcription(
     let gain_val = gain.unwrap_or(1.0).clamp(0.0, 2.0);
     let selected_channel = channel_index;
     let use_vad = vad_enabled.unwrap_or(false);
+    // Way 5: capture wake word (None or empty = disabled, behavior identical to today).
+    let wake_word: Option<String> = command_wake_word
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_lowercase());
     let fan_active = stt_active.clone();
     let fan_app = app.clone();
 
@@ -338,6 +344,8 @@ pub async fn start_transcription(
     let (final_tx, mut final_rx) = tokio::sync::mpsc::channel::<FinalJob>(256);
     let det_app = app.clone();
     let det_session = session_active.clone();
+    // Clone the (already-normalised) wake word into the detection worker.
+    let det_wake = wake_word.clone();
     tauri::async_runtime::spawn(async move {
         // Sentence buffer accumulates is_final fragments into complete sentences.
         // Flushes on sentence-ending punctuation or speech_final signal.
@@ -398,7 +406,7 @@ pub async fn start_transcription(
                                 // the Stage-2 fallback. Skipped when direct already hit.
                                 if !direct_found {
                                     if rhema_detection::is_isolated_command_context(&transcript, speech_final) {
-                                        check_voice_command(&det_app, &transcript);
+                                        check_voice_command(&det_app, &transcript, det_wake.as_deref());
                                     }
                                     if quotation_tx.try_send(transcript.clone()).is_err() {
                                         rhema_detection::metrics::log_channel_drop("quotation");
@@ -671,10 +679,10 @@ mod tests {
 /// step, or clear) and emit it to the frontend (`voice_command`); escalate an
 /// ambiguous command attempt to the Stage-2 fallback. Only short, command-like
 /// utterances are considered, so ordinary preaching never triggers navigation.
-fn check_voice_command(app: &AppHandle, transcript: &str) {
-    use rhema_detection::{is_control_command, parse_nav_command};
+fn check_voice_command(app: &AppHandle, transcript: &str, wake: Option<&str>) {
+    use rhema_detection::{is_control_command, parse_nav_command_with_wake};
 
-    let nav = parse_nav_command(transcript);
+    let nav = parse_nav_command_with_wake(transcript, wake);
     // Metrics: log every command attempt and whether it parsed (observe-only).
     let parsed_str: Option<String> = nav.as_ref().map(|cmd| format!("{cmd:?}"));
     rhema_detection::metrics::log_command_attempt(transcript, parsed_str.as_deref());
