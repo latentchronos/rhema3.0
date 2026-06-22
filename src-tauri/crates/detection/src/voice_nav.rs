@@ -178,20 +178,67 @@ fn is_structural(tok: &str) -> bool {
     is_forward(tok) || is_backward(tok) || is_unit_word(tok) || is_number_token(tok)
 }
 
+/// Words that look like direction targets but are NOT navigation units.
+/// Checked against raw tokens (before fuzzy remap) so garbled forms can’t hide them.
+const FALSE_FRIENDS: &[&str] = &[
+    "week", "weeks", "time", "times", "point", "points", "year", "years",
+    "sunday", "morning", "day", "thing", "things",
+];
+
 /// Parse a short utterance into a [`NavCommand`], or `None` if it is not a clean
 /// navigation/display command. Translation-agnostic: it only produces intent;
 /// existence (does the verse/chapter exist in the active version) is checked
 /// later at the `VerseLookup` layer.
 pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
-    let normalized = text.to_lowercase().replace(['\'', '’', '-'], " ");
-    let toks: Vec<&str> = normalized
+    // Step 1: build raw tokens — lowercase, apostrophes/hyphens → space,
+    // split on non-alphanumeric, drop empties. Keep ALL tokens (no filler drop yet).
+    let normalized = text.to_lowercase().replace(['\'', '\u{2019}', '-'], " ");
+    let all_toks: Vec<&str> = normalized
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty() && !NAV_FILLER.contains(s))
+        .filter(|s| !s.is_empty())
         .collect();
 
-    if toks.is_empty() || toks.len() > 10 {
+    if all_toks.is_empty() || all_toks.len() > 10 {
         return None;
     }
+
+    // Step 2: false-friend guard on RAW tokens (before fuzzy remap).
+    // If a direction word is immediately followed by a false-friend noun → reject.
+    for i in 0..all_toks.len().saturating_sub(1) {
+        if (is_forward(all_toks[i]) || is_backward(all_toks[i]))
+            && FALSE_FRIENDS.contains(&all_toks[i + 1])
+        {
+            return None;
+        }
+    }
+
+    // Step 3: filter filler → toks_raw.
+    let toks_raw: Vec<&str> = all_toks
+        .iter()
+        .copied()
+        .filter(|s| !NAV_FILLER.contains(s))
+        .collect();
+
+    if toks_raw.is_empty() || toks_raw.len() > 10 {
+        return None;
+    }
+
+    // Step 4: fuzzy-map each token via the Task 5.1 canonical matchers.
+    // Only remap tokens that are NOT already structural (direction/unit/number),
+    // and that are at least 3 characters long (prevents false mapping of short
+    // common words like "we", "ll" that are close in edit distance to nav words).
+    let mapped: Vec<String> = toks_raw.iter().map(|t| {
+        if is_structural(t) || t.len() < 3 {
+            // Token is already valid or too short to remap reliably — pass through.
+            t.to_string()
+        } else {
+            crate::command_match::canonical_command_word(t)
+                .or_else(|| crate::command_match::canonical_number_word(t))
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| t.to_string())
+        }
+    }).collect();
+    let toks: Vec<&str> = mapped.iter().map(|s| s.as_str()).collect();
 
     // Clear wins outright — "hide verse", "clear the screen", etc.
     if toks.iter().any(|t| matches!(*t, "clear" | "blank" | "hide")) {
@@ -266,6 +313,13 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
     } else {
         return None;
     };
+
+    // Step 5: require an explicit unit word for relative steps.
+    // A bare direction with no "verse"/"chapter" is rejected (closes the
+    // "next fires accidentally" hole).
+    if !toks.iter().any(|t| is_unit_word(t)) {
+        return None;
+    }
 
     let unit = if toks.iter().any(|t| matches!(*t, "chapter" | "chapters")) {
         NavUnit::Chapter
@@ -377,17 +431,36 @@ mod tests {
     fn relative_verse_steps_default_one() {
         use NavDirection::*;
         use NavUnit::*;
+        // These have an explicit unit word — still work.
         assert_eq!(parse_nav_command("next verse"), Some(step(Verse, Forward, 1)));
-        assert_eq!(parse_nav_command("go forward"), Some(step(Verse, Forward, 1)));
         assert_eq!(
             parse_nav_command("previous verse"),
             Some(step(Verse, Backward, 1))
         );
-        assert_eq!(parse_nav_command("go back"), Some(step(Verse, Backward, 1)));
-        assert_eq!(
-            parse_nav_command("previous one"),
-            Some(step(Verse, Backward, 1))
-        );
+        // These have no unit word — rejected by require-unit rule.
+        assert_eq!(parse_nav_command("go forward"), None);
+        assert_eq!(parse_nav_command("go back"), None);
+        assert_eq!(parse_nav_command("previous one"), None);
+    }
+
+    #[test]
+    fn bare_direction_without_unit_is_rejected() {
+        assert_eq!(parse_nav_command("next"), None);
+        assert_eq!(parse_nav_command("back"), None);
+    }
+
+    #[test]
+    fn direction_plus_unit_still_works_via_fuzzy() {
+        use NavDirection::*;
+        use NavUnit::*;
+        assert_eq!(parse_nav_command("next verse"), Some(step(Verse, Forward, 1)));
+        assert_eq!(parse_nav_command("nest phase"), Some(step(Verse, Forward, 1))); // accent-garbled
+    }
+
+    #[test]
+    fn false_friends_rejected() {
+        assert_eq!(parse_nav_command("next week"), None);
+        assert_eq!(parse_nav_command("next point"), None);
     }
 
     #[test]
