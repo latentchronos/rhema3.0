@@ -185,6 +185,17 @@ const FALSE_FRIENDS: &[&str] = &[
     "sunday", "morning", "day", "thing", "things",
 ];
 
+/// Way 2 (isolation gating): a final transcript is a command CANDIDATE only when
+/// the speaker finished the utterance (Deepgram `speech_final`) AND it is short
+/// and standalone — not a command-shaped phrase embedded in flowing speech.
+pub fn is_isolated_command_context(transcript: &str, speech_final: bool) -> bool {
+    if !speech_final {
+        return false;
+    }
+    let words = transcript.split_whitespace().count();
+    (1..=8).contains(&words)
+}
+
 /// Parse a short utterance into a [`NavCommand`], or `None` if it is not a clean
 /// navigation/display command. Translation-agnostic: it only produces intent;
 /// existence (does the verse/chapter exist in the active version) is checked
@@ -591,5 +602,15 @@ mod tests {
         assert_eq!(s["unit"], "verse");
         assert_eq!(s["direction"], "backward");
         assert_eq!(s["count"], 3);
+    }
+
+    #[test]
+    fn isolation_gate_only_fires_on_short_completed_utterances() {
+        assert!(is_isolated_command_context("next verse", true));
+        assert!(is_isolated_command_context("go to chapter three verse seven", true));
+        assert!(!is_isolated_command_context("next verse", false)); // not completed (embedded)
+        assert!(!is_isolated_command_context("", true));            // empty
+        assert!(!is_isolated_command_context(
+            "and so the next verse really shows us that god is faithful to us", true)); // too long (narration)
     }
 }
