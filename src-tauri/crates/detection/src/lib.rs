@@ -16,6 +16,7 @@ pub mod quotation;
 pub mod voice_nav;
 pub mod textutil;
 pub mod scripture_phonetic;
+pub mod command_match;
 
 pub use types::*;
 pub use error::*;
