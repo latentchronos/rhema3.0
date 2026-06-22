@@ -57,6 +57,7 @@ pub fn run() {
             commands::detection::previous_verse,
             commands::detection::go_to_reference,
             commands::detection::step_verses,
+            commands::detection::undo_navigation,
             commands::detection::start_session,
             commands::detection::end_session,
             commands::detection::session_status,

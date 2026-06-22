@@ -348,6 +348,40 @@ pub fn step_verses(
     })
 }
 
+/// Undo the most recent navigation (Way 4 undo backstop). Calls
+/// `CursorState::back()`, which pops the last entry from the undo history and
+/// returns the cursor to the previous position. Returns the reverted verse
+/// (status `"moved"`) when the history had an entry, or `"no_change"` when
+/// the history is empty or the cursor is cold / the DB is unavailable.
+#[tauri::command]
+pub fn undo_navigation(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let Some(tid) = resolve_tid(db, &cursor.position().translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    if !cursor.back() {
+        return Ok(NavCommandResult::NoChange);
+    }
+
+    Ok(match nav_verse_at(db, tid, cursor.position()) {
+        Some(verse) => NavCommandResult::Moved { verse },
+        None => NavCommandResult::NoChange,
+    })
+}
+
 /// Set the pastor's pre-service sermon notes (Phase 5, Bullet 5.2). Parses the
 /// notes for explicit verse references and stores a priming index in `AppState`;
 /// those verses receive a +0.25 boost in later suggestion ranking. Returns the

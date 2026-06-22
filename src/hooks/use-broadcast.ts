@@ -25,6 +25,7 @@ export type NavCommand =
   | { kind: "jump_chapter"; chapter: number }
   | { kind: "jump_chapter_verse"; chapter: number; verse: number }
   | { kind: "clear" }
+  | { kind: "undo" }
 
 /** Result of a `go_to_reference` / `step_verses` command (Bullet V4). */
 export type NavCommandResult =
@@ -212,6 +213,9 @@ export async function applyVoiceNavCommand(cmd: NavCommand): Promise<void> {
         chapter: cmd.chapter,
         verse: cmd.verse,
       }).catch(() => null)
+      break
+    case "undo":
+      result = await invoke<NavCommandResult>("undo_navigation").catch(() => null)
       break
   }
   if (result) handleNavResult(result)

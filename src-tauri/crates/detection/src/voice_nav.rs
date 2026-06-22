@@ -146,6 +146,8 @@ pub enum NavCommand {
     JumpChapterVerse { chapter: u16, verse: u16 },
     /// Clear / blank the live output.
     Clear,
+    /// Undo the most recent navigation (revert to the previous cursor position).
+    Undo,
 }
 
 /// Words that carry no navigation meaning and are dropped before parsing. NOT
@@ -173,9 +175,11 @@ fn is_number_token(tok: &str) -> bool {
 }
 
 /// Whether a non-consumed token is structurally allowed to remain — a direction,
-/// a unit, or a number. Anything else means the utterance is not a clean command.
+/// a unit, a number, or a special command keyword. Anything else means the
+/// utterance is not a clean command.
 fn is_structural(tok: &str) -> bool {
     is_forward(tok) || is_backward(tok) || is_unit_word(tok) || is_number_token(tok)
+        || tok == "undo"
 }
 
 /// Words that look like direction targets but are NOT navigation units.
@@ -232,6 +236,12 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
 
     if toks_raw.is_empty() || toks_raw.len() > 10 {
         return None;
+    }
+
+    // Undo wins on raw tokens — "undo", "undo that", etc. Checked before the
+    // fuzzy step so filler-like trailing words ("that") cannot shadow it.
+    if toks_raw.iter().any(|t| *t == "undo") {
+        return Some(NavCommand::Undo);
     }
 
     // Step 4: fuzzy-map each token via the Task 5.1 canonical matchers.
@@ -602,6 +612,12 @@ mod tests {
         assert_eq!(s["unit"], "verse");
         assert_eq!(s["direction"], "backward");
         assert_eq!(s["count"], 3);
+    }
+
+    #[test]
+    fn undo_command() {
+        assert_eq!(parse_nav_command("undo"), Some(NavCommand::Undo));
+        assert_eq!(parse_nav_command("undo that"), Some(NavCommand::Undo));
     }
 
     #[test]
