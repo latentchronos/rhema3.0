@@ -242,6 +242,15 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
         return Some(NavCommand::Undo);
     }
 
+    // Clear wins on raw tokens — checked BEFORE fuzzy mapping so that "blank"
+    // and "hide" are not accidentally remapped to nav slots by the fuzzy matcher
+    // (e.g. "blank" phonetically maps to "back"). Exact-only is safe because
+    // clear/blank/hide are no longer in COMMAND_SLOTS, so the fuzzy mapper cannot
+    // produce them from any other input.
+    if toks_raw.iter().any(|t| matches!(*t, "clear" | "blank" | "hide")) {
+        return Some(NavCommand::Clear);
+    }
+
     // Step 4: fuzzy-map each token via the Task 5.1 canonical matchers.
     // Only remap tokens that are NOT already structural (direction/unit/number),
     // and that are at least 3 characters long (prevents false mapping of short
@@ -258,11 +267,6 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
         }
     }).collect();
     let toks: Vec<&str> = mapped.iter().map(|s| s.as_str()).collect();
-
-    // Clear wins outright — "hide verse", "clear the screen", etc.
-    if toks.iter().any(|t| matches!(*t, "clear" | "blank" | "hide")) {
-        return Some(NavCommand::Clear);
-    }
 
     // Pass 1: absolute targets are a unit keyword immediately followed by a
     // number run ("chapter 3 verse 7"). Consume those tokens.
@@ -333,13 +337,11 @@ pub fn parse_nav_command(text: &str) -> Option<NavCommand> {
         return None;
     };
 
-    // Step 5: require an explicit unit word for relative steps.
-    // A bare direction with no "verse"/"chapter" is rejected (closes the
-    // "next fires accidentally" hole).
-    if !toks.iter().any(|t| is_unit_word(t)) {
-        return None;
-    }
-
+    // Step 5: unit defaults to Verse when no unit word is present.
+    // Bare directions ("next", "back", "previous") are accepted and default to
+    // NavUnit::Verse — the original pre-Phase-5.2 behaviour, restored because
+    // "verse" is unreliable under Nigerian-accent STT and users need bare
+    // directions to work. The full-match guard below still rejects ordinary speech.
     let unit = if toks.iter().any(|t| matches!(*t, "chapter" | "chapters")) {
         NavUnit::Chapter
     } else {
@@ -476,16 +478,23 @@ mod tests {
             parse_nav_command("previous verse"),
             Some(step(Verse, Backward, 1))
         );
-        // These have no unit word — rejected by require-unit rule.
-        assert_eq!(parse_nav_command("go forward"), None);
-        assert_eq!(parse_nav_command("go back"), None);
-        assert_eq!(parse_nav_command("previous one"), None);
+        // Bare directions now default to NavUnit::Verse (require-unit relaxed).
+        assert_eq!(parse_nav_command("go forward"), Some(step(Verse, Forward, 1)));
+        assert_eq!(parse_nav_command("go back"), Some(step(Verse, Backward, 1)));
+        // "previous one": "one" is a number token, which is structural, so this
+        // resolves to step(Verse, Backward, 1).
+        assert_eq!(parse_nav_command("previous one"), Some(step(Verse, Backward, 1)));
     }
 
     #[test]
-    fn bare_direction_without_unit_is_rejected() {
-        assert_eq!(parse_nav_command("next"), None);
-        assert_eq!(parse_nav_command("back"), None);
+    fn bare_direction_defaults_to_verse_step() {
+        use NavDirection::*;
+        use NavUnit::*;
+        // require-unit relaxed: bare directions default to NavUnit::Verse.
+        assert_eq!(parse_nav_command("next"), Some(step(Verse, Forward, 1)));
+        assert_eq!(parse_nav_command("back"), Some(step(Verse, Backward, 1)));
+        assert_eq!(parse_nav_command("previous"), Some(step(Verse, Backward, 1)));
+        assert_eq!(parse_nav_command("go back"), Some(step(Verse, Backward, 1)));
     }
 
     #[test]
@@ -648,6 +657,21 @@ mod tests {
     }
 
     // ---- parse_nav_command_with_wake (Way 5) ----
+
+    #[test]
+    fn accent_misheard_verse_still_steps() {
+        use NavDirection::*;
+        use NavUnit::*;
+        assert_eq!(parse_nav_command("next pass"), Some(step(Verse, Forward, 1)));   // pass->verse
+        assert_eq!(parse_nav_command("next class"), Some(step(Verse, Forward, 1)));  // class->verse
+    }
+
+    #[test]
+    fn common_speech_does_not_blank_screen() {
+        assert_eq!(parse_nav_command("hey"), None);
+        assert_eq!(parse_nav_command("let's try this"), None);
+        assert_eq!(parse_nav_command("no good"), None);
+    }
 
     #[test]
     fn wake_word_passthrough_when_none_or_empty() {

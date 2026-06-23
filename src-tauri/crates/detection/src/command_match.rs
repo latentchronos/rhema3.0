@@ -19,8 +19,13 @@ const MARGIN: usize = 1;
 
 static COMMAND_SLOTS: &[&str] = &[
     "next", "previous", "forward", "back", "verse", "verses",
-    "chapter", "chapters", "clear", "blank", "hide",
+    "chapter", "chapters",
 ];
+
+/// Known accent mis-hearings of "verse" (Nigerian English, observed in testing).
+/// Mapped with PRECEDENCE over the generic nearest-slot matcher, because some of
+/// these are phonetically closer to the wrong slot (e.g. "pass" -> "back").
+const VERSE_CONFUSIONS: &[&str] = &["pass", "class", "face", "bus", "fence", "phase", "vase"];
 
 static NUMBER_SLOTS: &[&str] = &[
     "zero", "one", "two", "three", "four", "five", "six", "seven",
@@ -128,7 +133,39 @@ fn nearest_slot(token: &str, sc: &'static SlotCodes) -> Option<&'static str> {
 
 /// Map a possibly-garbled STT token to the nearest command vocabulary word,
 /// or `None` if it is too far or too ambiguous.
+///
+/// Precedence order:
+/// 1. Exact match against COMMAND_SLOTS (handled inside `nearest_slot`).
+/// 2. VERSE_CONFUSIONS table — direct accent-confusion override.
+/// 3. Nearest-slot fuzzy matcher.
 pub fn canonical_command_word(token: &str) -> Option<&'static str> {
+    let lower = token.to_lowercase();
+
+    // (1) Exact match — fast path inside nearest_slot handles this, but we
+    //     need to check it here too so VERSE_CONFUSIONS doesn't shadow exact
+    //     slots. Check slots directly before the confusion table.
+    if command_codes().slots.iter().any(|&s| s == lower.as_str()) {
+        return nearest_slot(token, command_codes());
+    }
+
+    // (2) Verse-confusion override: known mis-hearings of "verse" in Nigerian
+    //     English take precedence over the generic fuzzy matcher, because some
+    //     of these tokens ("pass", "bus") are phonetically close to other slots
+    //     ("back", "verse") and the confusion table reflects observed STT output.
+    if VERSE_CONFUSIONS.contains(&lower.as_str()) {
+        return Some("verse");
+    }
+
+    // (3) Short-token guard: all command slots are at least 4 characters long.
+    //     A token shorter than 4 chars is too short to reliably fuzzy-match
+    //     (e.g. "hey" phonetically collides with "back" at edit-distance 2).
+    //     The VERSE_CONFUSIONS table above explicitly handles the one exception
+    //     ("bus" → "verse").
+    if lower.len() < 4 {
+        return None;
+    }
+
+    // (4) Generic nearest-slot fuzzy matcher.
     nearest_slot(token, command_codes())
 }
 
@@ -150,7 +187,8 @@ mod tests {
     fn exact_words_pass_through_all_categories() {
         assert_eq!(canonical_command_word("next"), Some("next"));
         assert_eq!(canonical_command_word("chapter"), Some("chapter"));
-        assert_eq!(canonical_command_word("clear"), Some("clear"));
+        // "clear" was removed from COMMAND_SLOTS (exact-only via voice_nav raw check).
+        assert_eq!(canonical_command_word("clear"), None);
         assert_eq!(canonical_number_word("three"), Some("three"));
     }
 
@@ -169,6 +207,19 @@ mod tests {
         assert_eq!(canonical_command_word("worship"), None);
         assert_eq!(canonical_command_word("hallelujah"), None);
         assert_eq!(canonical_command_word("verter"), None);
+    }
+
+    #[test]
+    fn verse_confusions_map_to_verse() {
+        assert_eq!(canonical_command_word("pass"), Some("verse"));
+        assert_eq!(canonical_command_word("class"), Some("verse"));
+        assert_eq!(canonical_command_word("face"), Some("verse"));
+    }
+
+    #[test]
+    fn common_words_no_longer_map_to_clear_family() {
+        assert_eq!(canonical_command_word("hey"), None);
+        assert_eq!(canonical_command_word("good"), None);
     }
 
 }
