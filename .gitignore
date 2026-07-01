@@ -33,6 +33,8 @@ data/verses-for-embedding.json
 
 # ML models and embeddings (downloaded, not committed)
 models/*
+model/
+*.gguf
 .env
 .superpowers/
 embeddings/*
