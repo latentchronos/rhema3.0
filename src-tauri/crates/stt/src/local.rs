@@ -1,14 +1,17 @@
 //! On-device speech-to-text via `transcribe-cpp` (the ggml/GGUF runtime used by Handy).
 //!
 //! Feature-gated behind `local-stt` so the default cloud build never pulls in the
-//! native ggml dependency. Loads a GGUF model (e.g. Parakeet or Cohere Transcribe)
-//! from a local path and transcribes fully offline.
+//! native ggml dependency. Loads a GGUF model (Parakeet or Cohere Transcribe) from a
+//! local path and transcribes fully offline.
 //!
-//! v1 uses the offline `Session::run` on fixed audio windows — the exact API path
-//! validated by the standalone spike (load → session → run → text). It transcribes
-//! ~34x faster than real-time on CPU, so windowed batching gives usable latency.
-//! The lower-latency streaming API (`Session::stream` / `feed` / `get_text`) is the
-//! next optimization and slots in behind this same [`SttEngine`] impl.
+//! Uses the crate's **streaming** API (`Session::stream` → `feed` → `text`) — the same
+//! low-latency path Handy drives — feeding 100 ms chunks and emitting the model's
+//! `tentative` (interim) text as [`TranscriptEvent::Partial`] and newly `committed`
+//! text as [`TranscriptEvent::Final`]. This mirrors Deepgram's partial/final semantics
+//! that the frontend already renders.
+//!
+//! NOTE: build in release (`--release`) for live use — the RNN-T predictor/joint are
+//! CPU loops that are an order of magnitude slower in a debug build.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,17 +20,16 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crossbeam_channel::Receiver;
 use tokio::sync::mpsc;
-use transcribe_cpp::{Model, RunOptions, Session};
+use transcribe_cpp::{CommitPolicy, Model, RunOptions, StreamOptions};
 
 use crate::engine::SttEngine;
 use crate::error::SttError;
 use crate::types::TranscriptEvent;
 
 const SAMPLE_RATE: usize = 16_000;
-/// Seconds of audio to accumulate before running one offline transcription pass.
-/// Balances latency against giving the model enough acoustic context.
-const WINDOW_SECS: usize = 3;
-const WINDOW_SAMPLES: usize = WINDOW_SECS * SAMPLE_RATE;
+/// Feed the model in 100 ms chunks (1600 samples @ 16 kHz) — the cadence used by the
+/// crate's streaming example. Small enough to feel live, large enough to be efficient.
+const CHUNK_SAMPLES: usize = SAMPLE_RATE / 10;
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -73,78 +75,125 @@ fn run_loop(
         .session()
         .map_err(|e| SttError::ConnectionFailed(format!("create session: {e}")))?;
 
-    let _ = event_tx.blocking_send(TranscriptEvent::Connected);
-    log::info!(
-        "[LocalSTT] loaded {} — transcribing in {}s windows",
-        model_path,
-        WINDOW_SECS
-    );
+    // Auto commit policy: the model decides when a token prefix is stable enough to
+    // move from `tentative` → `committed`, giving smooth incremental output.
+    let opts = StreamOptions {
+        commit_policy: CommitPolicy::Auto,
+        ..Default::default()
+    };
+    let mut stream = session
+        .stream(&RunOptions::default(), &opts)
+        .map_err(|e| SttError::ConnectionFailed(format!("open stream: {e}")))?;
 
-    let mut buf: Vec<i16> = Vec::with_capacity(WINDOW_SAMPLES);
+    let _ = event_tx.blocking_send(TranscriptEvent::Connected);
+    log::info!("[LocalSTT] streaming {} (100ms chunks)", model_path);
+
+    // f32 staging buffer; we feed exactly CHUNK_SAMPLES at a time.
+    let mut pending: Vec<f32> = Vec::with_capacity(CHUNK_SAMPLES * 4);
+    // Track what we've already emitted so we only send deltas.
+    let mut emitted_committed = String::new();
+    let mut last_partial = String::new();
+
     loop {
         if !keep_running.load(Ordering::SeqCst) {
             break;
         }
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
-                buf.extend_from_slice(&samples);
-                // Greedily drain any other queued frames so a slow transcription
-                // pass doesn't cause the bounded capture channel to overflow.
+                extend_f32(&mut pending, &samples);
+                // Drain anything else already queued so we never fall behind real-time.
                 while let Ok(more) = audio_rx.try_recv() {
-                    buf.extend_from_slice(&more);
+                    extend_f32(&mut pending, &more);
                 }
-                if buf.len() >= WINDOW_SAMPLES {
-                    transcribe_window(&mut session, &buf, &event_tx);
-                    buf.clear();
-                }
+                feed_full_chunks(&mut stream, &mut pending, &event_tx, &mut emitted_committed, &mut last_partial);
             }
-            // Silence gap: flush trailing audio so the tail of an utterance isn't dropped.
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if !buf.is_empty() {
-                    transcribe_window(&mut session, &buf, &event_tx);
-                    buf.clear();
+                // Idle gap: flush a short remainder so trailing words aren't stuck.
+                if !pending.is_empty() {
+                    if let Err(e) = stream.feed(&pending) {
+                        log::error!("[LocalSTT] feed failed: {e}");
+                    }
+                    pending.clear();
+                    emit(&stream, &event_tx, &mut emitted_committed, &mut last_partial);
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
     }
 
+    // Flush + finalize so the last partial becomes committed text.
+    if !pending.is_empty() {
+        let _ = stream.feed(&pending);
+    }
+    if let Err(e) = stream.finalize() {
+        log::error!("[LocalSTT] finalize failed: {e}");
+    }
+    emit(&stream, &event_tx, &mut emitted_committed, &mut last_partial);
+
     let _ = event_tx.blocking_send(TranscriptEvent::Disconnected);
     log::info!("[LocalSTT] engine stopped");
     Ok(())
 }
 
-fn transcribe_window(session: &mut Session, pcm_i16: &[i16], event_tx: &mpsc::Sender<TranscriptEvent>) {
-    // transcribe-cpp expects 16 kHz mono f32 in [-1, 1]; capture is already 16 kHz mono i16.
-    let pcm: Vec<f32> = pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
+/// Append i16 PCM as f32 in [-1, 1] (capture is already 16 kHz mono).
+fn extend_f32(dst: &mut Vec<f32>, src: &[i16]) {
+    dst.extend(src.iter().map(|&s| s as f32 / 32768.0));
+}
 
-    // Diagnostic: is the window actually carrying signal, or is capture silent?
-    // peak ~0 / rms ~0 ⇒ silent input (device/mic), not a transcription bug.
-    let peak = pcm.iter().fold(0f32, |m, &s| m.max(s.abs()));
-    let rms = (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len().max(1) as f32).sqrt();
-    log::info!(
-        "[LocalSTT] window {:.1}s ({} samples) peak={:.4} rms={:.5}",
-        pcm.len() as f32 / SAMPLE_RATE as f32,
-        pcm.len(),
-        peak,
-        rms
-    );
+/// Feed every complete 100 ms chunk currently staged, retaining the remainder.
+fn feed_full_chunks(
+    stream: &mut transcribe_cpp::Stream,
+    pending: &mut Vec<f32>,
+    event_tx: &mpsc::Sender<TranscriptEvent>,
+    emitted_committed: &mut String,
+    last_partial: &mut String,
+) {
+    let mut off = 0;
+    while pending.len() - off >= CHUNK_SAMPLES {
+        if let Err(e) = stream.feed(&pending[off..off + CHUNK_SAMPLES]) {
+            log::error!("[LocalSTT] feed failed: {e}");
+        }
+        off += CHUNK_SAMPLES;
+    }
+    if off > 0 {
+        pending.drain(0..off);
+        emit(stream, event_tx, emitted_committed, last_partial);
+    }
+}
 
-    match session.run(&pcm, &RunOptions::default()) {
-        Ok(result) => {
-            let text = result.text.trim().to_string();
-            if !text.is_empty() {
-                let _ = event_tx.blocking_send(TranscriptEvent::Final {
-                    transcript: text,
-                    words: Vec::new(),
-                    confidence: 1.0,
-                    speech_final: true,
-                });
-            }
+/// Emit committed deltas as Final and the tentative tail as Partial (deduplicated).
+fn emit(
+    stream: &transcribe_cpp::Stream,
+    event_tx: &mpsc::Sender<TranscriptEvent>,
+    emitted_committed: &mut String,
+    last_partial: &mut String,
+) {
+    let text = stream.text();
+
+    if text.committed != *emitted_committed {
+        let delta = text
+            .committed
+            .strip_prefix(emitted_committed.as_str())
+            .unwrap_or(&text.committed)
+            .trim()
+            .to_string();
+        *emitted_committed = text.committed.clone();
+        if !delta.is_empty() {
+            let _ = event_tx.blocking_send(TranscriptEvent::Final {
+                transcript: delta,
+                words: Vec::new(),
+                confidence: 1.0,
+                speech_final: true,
+            });
         }
-        Err(e) => {
-            log::error!("[LocalSTT] transcription failed: {e}");
-            let _ = event_tx.blocking_send(TranscriptEvent::Error(format!("local stt: {e}")));
-        }
+    }
+
+    let tentative = text.tentative.trim();
+    if !tentative.is_empty() && tentative != *last_partial {
+        *last_partial = tentative.to_string();
+        let _ = event_tx.blocking_send(TranscriptEvent::Partial {
+            transcript: tentative.to_string(),
+            words: Vec::new(),
+        });
     }
 }
