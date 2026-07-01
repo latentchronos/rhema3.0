@@ -55,5 +55,11 @@ crossbeam-channel = "0.5"
 dotenvy = "0.15"
 base64 = "0.22"
 
+[features]
+# Enable on-device GGUF transcription (Parakeet / Cohere Transcribe) as a selectable
+# STT provider. Off by default: the standard build stays cloud-only (Deepgram) and
+# pulls in no native ggml/BLAS dependency. Build with: cargo build --features local-stt
+local-stt = ["rhema-stt/local-stt"]
+
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"

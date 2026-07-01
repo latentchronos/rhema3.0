@@ -52,6 +52,11 @@ pub async fn start_transcription(
         )
     };
 
+    // STT provider selection. On-device transcription is opt-in: build with
+    // `--features local-stt` and set RHEMA_STT_PROVIDER=local. Otherwise Deepgram (cloud).
+    let use_local = cfg!(feature = "local-stt")
+        && std::env::var("RHEMA_STT_PROVIDER").as_deref() == Ok("local");
+
     // Resolve API key: use provided key, or fall back to DEEPGRAM_API_KEY env var
     let resolved_api_key = if api_key.is_empty() {
         std::env::var("DEEPGRAM_API_KEY").unwrap_or_default()
@@ -59,7 +64,8 @@ pub async fn start_transcription(
         api_key
     };
 
-    if resolved_api_key.is_empty() {
+    // The local engine needs no API key; only the cloud path requires one.
+    if !use_local && resolved_api_key.is_empty() {
         return Err(
             "No Deepgram API key provided. Set it in Settings or via DEEPGRAM_API_KEY env var."
                 .into(),
@@ -226,11 +232,33 @@ pub async fn start_transcription(
         language: None,
     };
 
-    let client = DeepgramClient::new(stt_config.clone());
-
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TranscriptEvent>(64);
-
     let conn_active = stt_active.clone();
+
+    // ── 4. Spawn the selected STT engine ────────────────────────────────
+    // Both engines publish to the same `event_tx`, so Task B and the detection
+    // pipeline below are provider-agnostic.
+    if use_local {
+        #[cfg(feature = "local-stt")]
+        {
+            use rhema_stt::SttEngine;
+            let model_path = std::env::var("RHEMA_STT_MODEL").unwrap_or_default();
+            log::info!("[STT] provider=local, model={model_path}");
+            let engine = rhema_stt::LocalSttClient::new(model_path);
+            let local_active = conn_active.clone();
+            let local_rx = deepgram_rx.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = engine.connect(local_rx, event_tx, local_active.clone()).await {
+                    log::error!("[STT] local engine failed: {e}");
+                }
+                local_active.store(false, Ordering::SeqCst);
+                log::info!("[STT] local engine task exited");
+            });
+        }
+        #[cfg(not(feature = "local-stt"))]
+        unreachable!("RHEMA_STT_PROVIDER=local requires the `local-stt` build feature");
+    } else {
+    let client = DeepgramClient::new(stt_config.clone());
 
     // Task A: run the Deepgram WebSocket connection.
     // On max reconnect failure, falls back to REST mode (hybrid).
@@ -305,6 +333,7 @@ pub async fn start_transcription(
         conn_active.store(false, Ordering::SeqCst);
         log::info!("Deepgram connection task exited");
     });
+    }
 
     // Task B: consume TranscriptEvents, emit to frontend, run detection
     let evt_active = stt_active.clone();

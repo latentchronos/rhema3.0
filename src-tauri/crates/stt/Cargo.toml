@@ -14,7 +14,11 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 url = "2"
 futures-util = "0.3"
 crossbeam-channel = "0.5"
+async-trait = "0.1"
+# On-device GGUF STT runtime (ggml). Optional; CPU-only (default `metal` feature off).
+transcribe-cpp = { version = "0.1.0", default-features = false, optional = true }
 
 [features]
 default = ["rest-fallback"]
 rest-fallback = ["reqwest"]
+local-stt = ["dep:transcribe-cpp"]

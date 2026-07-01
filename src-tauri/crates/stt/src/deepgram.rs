@@ -374,6 +374,19 @@ impl DeepgramClient {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::engine::SttEngine for DeepgramClient {
+    /// Forwards to the inherent `connect` — no behavior change for the cloud path.
+    async fn connect(
+        &self,
+        audio_rx: Receiver<Vec<i16>>,
+        event_tx: mpsc::Sender<TranscriptEvent>,
+        keep_running: Arc<AtomicBool>,
+    ) -> Result<(), SttError> {
+        DeepgramClient::connect(self, audio_rx, event_tx, keep_running).await
+    }
+}
+
 /// Parse a Deepgram JSON response and send the corresponding TranscriptEvent.
 async fn parse_and_send(
     text: &str,
