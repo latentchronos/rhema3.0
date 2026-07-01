@@ -88,6 +88,11 @@ fn run_loop(
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
                 buf.extend_from_slice(&samples);
+                // Greedily drain any other queued frames so a slow transcription
+                // pass doesn't cause the bounded capture channel to overflow.
+                while let Ok(more) = audio_rx.try_recv() {
+                    buf.extend_from_slice(&more);
+                }
                 if buf.len() >= WINDOW_SAMPLES {
                     transcribe_window(&mut session, &buf, &event_tx);
                     buf.clear();
@@ -112,6 +117,19 @@ fn run_loop(
 fn transcribe_window(session: &mut Session, pcm_i16: &[i16], event_tx: &mpsc::Sender<TranscriptEvent>) {
     // transcribe-cpp expects 16 kHz mono f32 in [-1, 1]; capture is already 16 kHz mono i16.
     let pcm: Vec<f32> = pcm_i16.iter().map(|&s| s as f32 / 32768.0).collect();
+
+    // Diagnostic: is the window actually carrying signal, or is capture silent?
+    // peak ~0 / rms ~0 ⇒ silent input (device/mic), not a transcription bug.
+    let peak = pcm.iter().fold(0f32, |m, &s| m.max(s.abs()));
+    let rms = (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len().max(1) as f32).sqrt();
+    log::info!(
+        "[LocalSTT] window {:.1}s ({} samples) peak={:.4} rms={:.5}",
+        pcm.len() as f32 / SAMPLE_RATE as f32,
+        pcm.len(),
+        peak,
+        rms
+    );
+
     match session.run(&pcm, &RunOptions::default()) {
         Ok(result) => {
             let text = result.text.trim().to_string();
