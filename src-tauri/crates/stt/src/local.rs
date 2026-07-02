@@ -23,7 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crossbeam_channel::Receiver;
 use tokio::sync::mpsc;
-use transcribe_cpp::{Model, RunOptions, Session};
+use transcribe_cpp::{Model, RunOptions, Session, SessionOptions};
 
 use crate::engine::SttEngine;
 use crate::error::SttError;
@@ -33,12 +33,17 @@ const SR: usize = 16_000;
 /// Below this RMS a chunk is treated as silence. Low enough to catch quiet speech
 /// while still gating true silence / room noise.
 const SILENCE_RMS: f32 = 0.006;
-/// Trailing silence after speech that ends an utterance (~0.7s).
-const SILENCE_HANG: usize = SR * 7 / 10;
-/// Re-transcribe for a live preview after this much new audio (~1.2s).
-const PARTIAL_EVERY: usize = SR * 6 / 5;
-/// Force-finalize an utterance this long even without a pause (bounds latency + cost).
-const MAX_UTTERANCE: usize = SR * 12;
+/// Trailing silence after speech that ends an utterance (~0.5s).
+const SILENCE_HANG: usize = SR / 2;
+/// Re-transcribe for a live preview after this much new audio (~0.8s).
+const PARTIAL_EVERY: usize = SR * 4 / 5;
+/// Hard commit window: force-finalize a continuous utterance this long even without
+/// a pause (~5s). This is the single most important latency/cost knob — it bounds
+/// BOTH how long continuous speech can go before a `Final` appears AND the largest
+/// buffer any single `run()` ever sees. Every partial re-transcribes the current
+/// buffer from scratch, so an unbounded window makes per-run cost grow without limit
+/// (the 6.8s stalls we saw at ~14s buffers). Keep this small.
+const MAX_UTTERANCE: usize = SR * 5;
 /// Require at least this much speech before finalizing (avoids empty blips, ~0.3s).
 const MIN_SPEECH: usize = SR * 3 / 10;
 /// While waiting for speech, keep at most this much trailing audio so leading
@@ -85,12 +90,33 @@ fn run_loop(
 
     let model = Model::load(std::path::Path::new(&model_path))
         .map_err(|e| SttError::ConnectionFailed(format!("load model {model_path}: {e}")))?;
+
+    // Pin ggml's CPU thread count. Left at the library default (all cores) it
+    // oversubscribes against audio capture + detection + the Tauri UI, which is what
+    // blew one decode's joint step up to ~5s. Leave a couple of cores free.
+    let n_threads = std::env::var("RHEMA_STT_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4) as i32;
+            (cores - 2).clamp(2, 8)
+        });
     let mut session = model
-        .session()
+        .session_with(&SessionOptions {
+            n_threads,
+            ..Default::default()
+        })
         .map_err(|e| SttError::ConnectionFailed(format!("create session: {e}")))?;
 
     let _ = event_tx.blocking_send(TranscriptEvent::Connected);
-    log::info!("[LocalSTT] utterance mode, model {}", model_path);
+    log::info!(
+        "[LocalSTT] utterance mode ({n_threads} threads, {}s window), model {}",
+        MAX_UTTERANCE / SR,
+        model_path
+    );
 
     let mut utter: Vec<f32> = Vec::with_capacity(MAX_UTTERANCE);
     let mut had_speech = false;
