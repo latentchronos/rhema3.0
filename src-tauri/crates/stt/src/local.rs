@@ -28,7 +28,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossbeam_channel::Receiver;
@@ -120,6 +120,41 @@ fn resolve_threads() -> i32 {
         })
 }
 
+/// Diagnostic: how far behind real time the engine is running. Audio is produced at
+/// 1x, so `(wall time since first sample) - (audio seconds consumed)` is roughly the
+/// unprocessed backlog. Also reports the channel depth (`queued` frames) — the most
+/// direct signal: near the channel capacity means we're maxed out and lagging.
+/// Zero behaviour change; logs at most every 2s.
+struct BacklogMeter {
+    start: Option<Instant>,
+    consumed: u64,
+    last_report: Instant,
+}
+
+impl BacklogMeter {
+    fn new() -> Self {
+        Self {
+            start: None,
+            consumed: 0,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record(&mut self, samples: usize, queued: usize) {
+        let start = *self.start.get_or_insert_with(Instant::now);
+        self.consumed += samples as u64;
+        if self.last_report.elapsed() >= Duration::from_secs(2) {
+            let produced = start.elapsed().as_secs_f32();
+            let consumed_s = self.consumed as f32 / SR as f32;
+            log::info!(
+                "[LocalSTT] backlog ~{:.1}s behind real-time (queue {queued} frames)",
+                (produced - consumed_s).max(0.0),
+            );
+            self.last_report = Instant::now();
+        }
+    }
+}
+
 fn run_loop(
     model_path: String,
     audio_rx: Receiver<Vec<i16>>,
@@ -150,6 +185,7 @@ fn run_loop(
     let mut had_speech = false;
     let mut silence: usize = 0; // trailing silence samples since last speech
     let mut since_partial: usize = 0; // new samples since last preview run
+    let mut meter = BacklogMeter::new();
 
     loop {
         if !keep_running.load(Ordering::SeqCst) {
@@ -157,10 +193,13 @@ fn run_loop(
         }
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
+                // Frames still waiting after this one = the current backlog depth.
+                let queued = audio_rx.len();
                 let mut batch = to_f32(&samples);
                 while let Ok(more) = audio_rx.try_recv() {
                     batch.extend(to_f32(&more));
                 }
+                meter.record(batch.len(), queued);
                 let voiced = rms(&batch) > SILENCE_RMS;
                 if voiced {
                     had_speech = true;
@@ -275,6 +314,7 @@ fn run_stream_loop(
 
     // Byte offset into the committed prefix already emitted as `Final`.
     let mut final_upto = 0usize;
+    let mut meter = BacklogMeter::new();
 
     loop {
         if !keep_running.load(Ordering::SeqCst) {
@@ -282,10 +322,12 @@ fn run_stream_loop(
         }
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
+                let queued = audio_rx.len();
                 let mut batch = to_f32(&samples);
                 while let Ok(more) = audio_rx.try_recv() {
                     batch.extend(to_f32(&more));
                 }
+                meter.record(batch.len(), queued);
                 let update = match stream.feed(&batch) {
                     Ok(u) => u,
                     Err(e) => {
