@@ -66,12 +66,14 @@ const MIN_SPEECH: usize = SR * 3 / 10;
 /// While waiting for speech, keep at most this much trailing audio so leading
 /// silence never accumulates unbounded (~0.5s of pre-roll context).
 const PREROLL: usize = SR / 2;
-/// Drop-to-latest cap (~0.75s). If more than this much un-ingested audio is waiting
-/// (a standing backlog that would make the transcript trail real speech), discard the
-/// stale head and keep only the newest ~0.75s. The backlog meter showed the queue
-/// parks at a constant depth without draining — a fixed latency, not a runaway — so
-/// this fires mostly once to clear it, then rarely, keeping the transcript live.
-const LAG_CAP: usize = SR * 3 / 4;
+/// Partial previews re-encode only the last ~1.6s of the utterance, not the whole
+/// (growing) thing. `session.run` re-runs the *encoder* over its entire input every
+/// call, and that cost grows with utterance length — a partial near the 5s cap was
+/// re-encoding 5s of audio (seconds of CPU, hidden from the decoder-only timing log),
+/// which fell behind real time and backed audio up. Capping the preview window keeps
+/// per-partial cost flat so the engine stays ahead of the mic. The Final still encodes
+/// the whole utterance for an accurate committed line.
+const PARTIAL_WINDOW: usize = SR * 8 / 5;
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -206,17 +208,6 @@ fn run_loop(
                     batch.extend(to_f32(&more));
                 }
                 meter.record(batch.len(), queued);
-                // Drop-to-latest: never carry more than ~0.75s of un-ingested audio, so
-                // the transcript tracks live speech instead of replaying a standing
-                // backlog. Discards already-stale audio only; live speech is unaffected.
-                if batch.len() > LAG_CAP {
-                    let drop = batch.len() - LAG_CAP;
-                    batch.drain(0..drop);
-                    log::info!(
-                        "[LocalSTT] dropped {:.1}s stale audio to stay live",
-                        drop as f32 / SR as f32
-                    );
-                }
                 let voiced = rms(&batch) > SILENCE_RMS;
                 if voiced {
                     had_speech = true;
@@ -240,8 +231,10 @@ fn run_loop(
                     silence = 0;
                     since_partial = 0;
                 } else if had_speech && since_partial >= PARTIAL_EVERY {
-                    // Live preview of the utterance so far.
-                    if let Some(text) = transcribe(&mut session, &utter) {
+                    // Live preview: re-encode only the recent window, not the whole
+                    // utterance, so per-partial cost stays flat and the engine keeps up.
+                    let start = utter.len().saturating_sub(PARTIAL_WINDOW);
+                    if let Some(text) = transcribe(&mut session, &utter[start..]) {
                         send_partial(&event_tx, text);
                     }
                     since_partial = 0;
