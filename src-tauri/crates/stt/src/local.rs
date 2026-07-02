@@ -66,6 +66,12 @@ const MIN_SPEECH: usize = SR * 3 / 10;
 /// While waiting for speech, keep at most this much trailing audio so leading
 /// silence never accumulates unbounded (~0.5s of pre-roll context).
 const PREROLL: usize = SR / 2;
+/// Drop-to-latest cap (~0.75s). If more than this much un-ingested audio is waiting
+/// (a standing backlog that would make the transcript trail real speech), discard the
+/// stale head and keep only the newest ~0.75s. The backlog meter showed the queue
+/// parks at a constant depth without draining — a fixed latency, not a runaway — so
+/// this fires mostly once to clear it, then rarely, keeping the transcript live.
+const LAG_CAP: usize = SR * 3 / 4;
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -200,6 +206,17 @@ fn run_loop(
                     batch.extend(to_f32(&more));
                 }
                 meter.record(batch.len(), queued);
+                // Drop-to-latest: never carry more than ~0.75s of un-ingested audio, so
+                // the transcript tracks live speech instead of replaying a standing
+                // backlog. Discards already-stale audio only; live speech is unaffected.
+                if batch.len() > LAG_CAP {
+                    let drop = batch.len() - LAG_CAP;
+                    batch.drain(0..drop);
+                    log::info!(
+                        "[LocalSTT] dropped {:.1}s stale audio to stay live",
+                        drop as f32 / SR as f32
+                    );
+                }
                 let voiced = rms(&batch) > SILENCE_RMS;
                 if voiced {
                     had_speech = true;
@@ -438,7 +455,11 @@ fn send_final(event_tx: &mpsc::Sender<TranscriptEvent>, transcript: String) {
 }
 
 fn send_partial(event_tx: &mpsc::Sender<TranscriptEvent>, transcript: String) {
-    let _ = event_tx.blocking_send(TranscriptEvent::Partial {
+    // Non-blocking: a partial is a disposable preview. If the event consumer is briefly
+    // behind, dropping one preview is far better than stalling audio intake (a blocked
+    // send lets the audio queue build the standing backlog that makes the transcript
+    // trail real speech). Finals still use blocking_send so they're never lost.
+    let _ = event_tx.try_send(TranscriptEvent::Partial {
         transcript,
         words: Vec::new(),
     });
