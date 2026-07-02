@@ -63,3 +63,14 @@ local-stt = ["rhema-stt/local-stt"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"
+
+# On-device STT is compute-heavy (RNN-T decode loops + ggml). Optimize just these
+# crates even in dev builds so `tauri dev` transcription runs at real-time speed
+# WITHOUT needing --release. The rest of the app stays debuggable. These specs only
+# apply when the local-stt feature pulls the crates in; otherwise they're inert.
+[profile.dev.package.rhema-stt]
+opt-level = 3
+[profile.dev.package.transcribe-cpp]
+opt-level = 3
+[profile.dev.package.transcribe-cpp-sys]
+opt-level = 3

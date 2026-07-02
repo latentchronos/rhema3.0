@@ -30,6 +30,9 @@ const SAMPLE_RATE: usize = 16_000;
 /// Feed the model in 100 ms chunks (1600 samples @ 16 kHz) — the cadence used by the
 /// crate's streaming example. Small enough to feel live, large enough to be efficient.
 const CHUNK_SAMPLES: usize = SAMPLE_RATE / 10;
+/// If decoding ever falls this far behind real time, drop the oldest audio to stay
+/// live instead of growing latency (and the stop-time backlog) without bound. ~5 s.
+const MAX_BACKLOG_SAMPLES: usize = SAMPLE_RATE * 5;
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -94,7 +97,7 @@ fn run_loop(
     let mut emitted_committed = String::new();
     let mut last_partial = String::new();
 
-    loop {
+    'outer: loop {
         if !keep_running.load(Ordering::SeqCst) {
             break;
         }
@@ -105,7 +108,31 @@ fn run_loop(
                 while let Ok(more) = audio_rx.try_recv() {
                     extend_f32(&mut pending, &more);
                 }
-                feed_full_chunks(&mut stream, &mut pending, &event_tx, &mut emitted_committed, &mut last_partial);
+                // If decoding can't keep up, drop the oldest audio so latency (and the
+                // stop-time backlog) stays bounded rather than growing forever.
+                if pending.len() > MAX_BACKLOG_SAMPLES {
+                    let overflow = pending.len() - MAX_BACKLOG_SAMPLES;
+                    pending.drain(0..overflow);
+                    log::warn!(
+                        "[LocalSTT] behind real-time, dropped {}ms of audio",
+                        overflow * 1000 / SAMPLE_RATE
+                    );
+                }
+                // Feed complete chunks, but re-check the stop flag between chunks so a
+                // stop request is honored promptly instead of after the whole backlog.
+                let mut off = 0;
+                while pending.len() - off >= CHUNK_SAMPLES {
+                    if !keep_running.load(Ordering::SeqCst) {
+                        pending.drain(0..off);
+                        break 'outer;
+                    }
+                    if let Err(e) = stream.feed(&pending[off..off + CHUNK_SAMPLES]) {
+                        log::error!("[LocalSTT] feed failed: {e}");
+                    }
+                    off += CHUNK_SAMPLES;
+                }
+                pending.drain(0..off);
+                emit(&stream, &event_tx, &mut emitted_committed, &mut last_partial);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Idle gap: flush a short remainder so trailing words aren't stuck.
@@ -121,10 +148,9 @@ fn run_loop(
         }
     }
 
-    // Flush + finalize so the last partial becomes committed text.
-    if !pending.is_empty() {
-        let _ = stream.feed(&pending);
-    }
+    // Finalize so the last tentative text is committed. We deliberately do NOT feed
+    // any remaining `pending` backlog here — on stop the user wants a prompt exit,
+    // not a wait while seconds of buffered audio decode.
     if let Err(e) = stream.finalize() {
         log::error!("[LocalSTT] finalize failed: {e}");
     }
@@ -138,27 +164,6 @@ fn run_loop(
 /// Append i16 PCM as f32 in [-1, 1] (capture is already 16 kHz mono).
 fn extend_f32(dst: &mut Vec<f32>, src: &[i16]) {
     dst.extend(src.iter().map(|&s| s as f32 / 32768.0));
-}
-
-/// Feed every complete 100 ms chunk currently staged, retaining the remainder.
-fn feed_full_chunks(
-    stream: &mut transcribe_cpp::Stream,
-    pending: &mut Vec<f32>,
-    event_tx: &mpsc::Sender<TranscriptEvent>,
-    emitted_committed: &mut String,
-    last_partial: &mut String,
-) {
-    let mut off = 0;
-    while pending.len() - off >= CHUNK_SAMPLES {
-        if let Err(e) = stream.feed(&pending[off..off + CHUNK_SAMPLES]) {
-            log::error!("[LocalSTT] feed failed: {e}");
-        }
-        off += CHUNK_SAMPLES;
-    }
-    if off > 0 {
-        pending.drain(0..off);
-        emit(stream, event_tx, emitted_committed, last_partial);
-    }
 }
 
 /// Emit committed deltas as Final and the tentative tail as Partial (deduplicated).
