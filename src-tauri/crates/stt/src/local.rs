@@ -35,8 +35,12 @@ const SR: usize = 16_000;
 const SILENCE_RMS: f32 = 0.006;
 /// Trailing silence after speech that ends an utterance (~0.5s).
 const SILENCE_HANG: usize = SR / 2;
-/// Re-transcribe for a live preview after this much new audio (~0.8s).
-const PARTIAL_EVERY: usize = SR * 4 / 5;
+/// Re-transcribe for a live preview after this much new audio (~0.35s). This is the
+/// live-transcript refresh rate AND the first-word latency (the first partial fires
+/// this long after speech onset). Kept small because decode has huge headroom on a
+/// bounded window — a full 5s buffer decodes in ~160ms (~30x real-time), so even a
+/// ~0.35s cadence runs <50% duty and never backs up the audio channel.
+const PARTIAL_EVERY: usize = SR * 35 / 100;
 /// Hard commit window: force-finalize a continuous utterance this long even without
 /// a pause (~5s). This is the single most important latency/cost knob — it bounds
 /// BOTH how long continuous speech can go before a `Final` appears AND the largest

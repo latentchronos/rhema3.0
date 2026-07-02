@@ -86,8 +86,14 @@ pub async fn start_transcription(
     audio_active.store(true, Ordering::SeqCst);
 
     // ── 2. Prepare channels ─────────────────────────────────────────────
-    // Deepgram channel carries Vec<i16> (the samples from each AudioFrame).
-    let (deepgram_tx, deepgram_rx) = crossbeam_channel::bounded::<Vec<i16>>(64);
+    // STT audio channel carries Vec<i16> (the samples from each AudioFrame).
+    // Sized to absorb a full transcription pause without dropping speech: the local
+    // engine can't drain while a blocking decode runs, and at ~20ms gated frames a
+    // 64-slot buffer holds only ~1.3s — shorter than a worst-case decode, so audio
+    // was being discarded mid-utterance (the `drop channel=deepgram` flood). 1024
+    // slots (~20s) is trivial memory and drops nothing; the ~30x-real-time engine
+    // drains straight back to empty after each decode, so it adds no steady-state lag.
+    let (deepgram_tx, deepgram_rx) = crossbeam_channel::bounded::<Vec<i16>>(1024);
 
     // ── 3. Spawn the audio-capture + fan-out thread ─────────────────────
     // cpal's `Stream` (inside `AudioCapture`) is !Send, so we must create
