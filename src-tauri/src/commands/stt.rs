@@ -504,7 +504,7 @@ pub async fn start_transcription(
                         continue;
                     }
                     match job {
-                        FinalJob::Final { transcript, speech_final, n_words, span_secs } => {
+                        FinalJob::Final { transcript, speech_final, n_words, span_secs, asr_confidence } => {
                             // ── Pace-driven adaptive timeout (Task 2.3) ──────────
                             // Measure wall-clock gap since the last final, feed the
                             // EMA estimator, then push the smoothed gap back into
@@ -528,8 +528,11 @@ pub async fn start_transcription(
                             if !transcript.is_empty() {
                                 // Translation commands: "read in NIV", "switch to ESV"
                                 check_translation_command(&det_app, &transcript);
-                                // Direct detection: instant (regex), every is_final
-                                let direct_found = run_direct_detection(&det_app, &transcript, true);
+                                // Direct detection: instant (regex), every is_final.
+                                // ASR confidence gates projection (low-confidence finals
+                                // stay review-only, never auto-project).
+                                let direct_found =
+                                    run_direct_detection(&det_app, &transcript, true, asr_confidence);
                                 // Reading mode: does transcript match expected verse?
                                 check_reading_mode(&det_app, &transcript, direct_found);
                                 // Intent layer (Gap 2): a short voice control command
@@ -580,7 +583,7 @@ pub async fn start_transcription(
                     // like "Psalm chapter 2 verse 3". Tagged is_final=false: it primes the
                     // merger/context and shows in the panel, but must not move the screen
                     // (projection is committed-only — RHEMA_V2_ARCHITECTURE §4).
-                    run_direct_detection(&det_app, &transcript, false);
+                    run_direct_detection(&det_app, &transcript, false, 1.0);
                 }
 
                 // Periodic tick: activates the sentence buffer's timeout flush
@@ -659,6 +662,7 @@ pub async fn start_transcription(
                         speech_final,
                         n_words,
                         span_secs,
+                        asr_confidence: confidence,
                     }).is_err() {
                         rhema_detection::metrics::log_channel_drop("final");
                     }
@@ -763,6 +767,10 @@ enum FinalJob {
         n_words: usize,
         /// `last_word.end - first_word.start` in seconds; 0.0 when fewer than 2 words.
         span_secs: f64,
+        /// ASR transcription confidence for this final (how sure the model was of the
+        /// WORDS, distinct from detection confidence). 1.0 when the engine provides none
+        /// — including the streaming path today (per-word streaming confidence deferred).
+        asr_confidence: f64,
     },
     UtteranceEnd,
 }
@@ -805,6 +813,50 @@ mod tests {
         let (n, span) = word_span(&words);
         assert_eq!(n, 3);
         assert!((span - 3.0).abs() < 1e-9, "expected span=3.0 got {span}");
+    }
+
+    fn auto_queued_detection() -> crate::commands::detection::DetectionResult {
+        crate::commands::detection::DetectionResult {
+            verse_ref: "John 3:16".into(),
+            verse_text: String::new(),
+            book_name: "John".into(),
+            book_number: 43,
+            chapter: 3,
+            verse: 16,
+            confidence: 0.95,
+            source: "direct".into(),
+            auto_queued: true,
+            raw_score: 0.95,
+            minimum_threshold: 0.5,
+            auto_queue_threshold: 0.8,
+            decision: "auto_queued".into(),
+            explanation: String::new(),
+            transcript_snippet: String::new(),
+            is_final: true,
+        }
+    }
+
+    #[test]
+    fn low_asr_confidence_demotes_auto_queue_to_review() {
+        let mut results = vec![auto_queued_detection()];
+        gate_low_confidence(&mut results, PROJECT_CONF - 0.1);
+        assert!(!results[0].auto_queued, "should be demoted");
+        assert_eq!(results[0].decision, "review_required");
+    }
+
+    #[test]
+    fn high_asr_confidence_leaves_auto_queue_intact() {
+        let mut results = vec![auto_queued_detection()];
+        gate_low_confidence(&mut results, 1.0);
+        assert!(results[0].auto_queued, "should be untouched");
+        assert_eq!(results[0].decision, "auto_queued");
+    }
+
+    #[test]
+    fn gate_at_exact_threshold_is_a_noop() {
+        let mut results = vec![auto_queued_detection()];
+        gate_low_confidence(&mut results, PROJECT_CONF);
+        assert!(results[0].auto_queued, "threshold is inclusive-pass");
     }
 }
 
@@ -873,8 +925,8 @@ pub async fn run_stage2_worker(
                         res.confidence
                     );
                     // Stage-2 resolves an ambiguous (already-final) utterance to a
-                    // concrete reference — authoritative, may project.
-                    run_direct_detection(&app, &reference, true);
+                    // concrete reference — authoritative (LLM-resolved), may project.
+                    run_direct_detection(&app, &reference, true, 1.0);
                 }
             }
             Ok(_) => log::debug!("stage2: '{transcript}' not scripture"),
@@ -891,7 +943,16 @@ pub async fn run_stage2_worker(
 /// projection (preview selection + auto-queue) on the frontend. Partial detections are
 /// tagged `is_final = false` so the frontend shows them in the panel/operator console
 /// without moving the screen. See RHEMA_V2_ARCHITECTURE §4 (committed-only projection).
-fn run_direct_detection(app: &AppHandle, transcript: &str, is_final: bool) -> bool {
+///
+/// `asr_confidence` is the transcription confidence for `transcript` (how sure the ASR was
+/// of the WORDS). Finals below [`PROJECT_CONF`] are held out of auto-projection — they stay
+/// review-only in the panel — even if the detection pattern-match is strong.
+fn run_direct_detection(
+    app: &AppHandle,
+    transcript: &str,
+    is_final: bool,
+    asr_confidence: f64,
+) -> bool {
     use rhema_detection::{DetectionMerger, DirectDetector};
 
     let epoch_at_detection = app.state::<EpochLock>().current();
@@ -936,7 +997,7 @@ fn run_direct_detection(app: &AppHandle, transcript: &str, is_final: bool) -> bo
         Ok(s) => s,
         Err(_) => {
             // AppState locked by semantic worker — emit results without verse text
-            let results: Vec<super::detection::DetectionResult> = merged
+            let mut results: Vec<super::detection::DetectionResult> = merged
                 .iter()
                 .map(|m| {
                     let vr = &m.detection.verse_ref;
@@ -967,6 +1028,7 @@ fn run_direct_detection(app: &AppHandle, transcript: &str, is_final: bool) -> bo
                     r.confidence * 100.0
                 );
             }
+            gate_low_confidence(&mut results, asr_confidence);
             emit_detections(app, "direct", results, epoch_at_detection);
             return has_high_confidence;
         }
@@ -996,8 +1058,31 @@ fn run_direct_detection(app: &AppHandle, transcript: &str, is_final: bool) -> bo
         );
     }
     drop(app_state);
+    gate_low_confidence(&mut results, asr_confidence);
     emit_detections(app, "direct", results, epoch_at_detection);
     has_high_confidence
+}
+
+/// Minimum ASR transcription confidence for a final to be allowed to auto-project. Below
+/// this, a detection still shows in the panel/operator console but is demoted to
+/// review-only — the operator decides. The streaming path reports 1.0 today (per-word
+/// streaming confidence deferred), so this currently bites only on the offline engine.
+const PROJECT_CONF: f64 = 0.55;
+
+/// Confidence-gated projection: demote every auto-queued detection to review-only when the
+/// underlying transcription confidence is below [`PROJECT_CONF`]. The ASR being unsure of
+/// the WORDS is independent of the detector being sure of the PATTERN, so a strong match on
+/// a shaky transcript must not auto-project. No-op at/above the threshold.
+fn gate_low_confidence(results: &mut [super::detection::DetectionResult], asr_confidence: f64) {
+    if asr_confidence >= PROJECT_CONF {
+        return;
+    }
+    for r in results.iter_mut() {
+        if r.auto_queued {
+            r.auto_queued = false;
+            r.decision = "review_required".to_string();
+        }
+    }
 }
 
 /// Phase 5 (Bullet 5.3): ingest the sentence into the topic vector and, if a
