@@ -298,9 +298,11 @@ pub async fn start_transcription(
                         for transition in speech.process(&frame) {
                             match transition {
                                 SpeechTransition::Started => {
+                                    log::info!("[VAD] speech started");
                                     let _ = fan_app.emit("stt_speech_started", ());
                                 }
                                 SpeechTransition::Ended => {
+                                    log::info!("[VAD] speech ended");
                                     let _ = fan_app.emit("stt_speech_ended", ());
                                 }
                             }
