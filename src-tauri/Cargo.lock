@@ -4278,6 +4278,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rhema-vad"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "ort",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

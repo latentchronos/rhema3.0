@@ -1,0 +1,21 @@
+[package]
+name = "rhema-vad"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+# Neural Silero VAD via ONNX Runtime. Optional so the default build (and the pure
+# re-blocker / endpoint state machine) never pull the native runtime. Same `ort` version
+# as rhema-detection, so the two share one ONNX Runtime in any build that enables both.
+ort = { version = "2.0.0-rc.12", optional = true }
+
+[features]
+default = []
+silero = ["dep:ort"]
+
+# Runtime smoke for the Silero ONNX path (needs model/silero_vad.onnx).
+[[example]]
+name = "vad_smoke"
+required-features = ["silero"]
