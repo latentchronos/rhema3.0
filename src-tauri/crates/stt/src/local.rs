@@ -400,6 +400,15 @@ fn run_stream_loop(
     let mut restart_attempts: u32 = 0;
     let mut connected_announced = false;
 
+    // Opt-in confidence probe (`RHEMA_STT_CONF_PROBE=1`): every few seconds, snapshot the
+    // stream and log how many tokens carry a finite `p` (per-token confidence) plus the
+    // snapshot cost. This answers two feasibility questions before we build streaming
+    // confidence gating on it: (1) does THIS model populate `p` at all, and (2) does
+    // `snapshot()` stay cheap as the transcript grows (it materializes ALL tokens). Off by
+    // default — it adds a periodic O(total tokens) snapshot when enabled.
+    let conf_probe = std::env::var("RHEMA_STT_CONF_PROBE").as_deref() == Ok("1");
+    let mut last_probe = Instant::now();
+
     // Outer lifecycle loop: each iteration owns exactly one native stream. A stream FAULT
     // (`feed` error or `StreamState::Failed`) breaks the inner feed loop and falls through
     // to recreate the stream; a CLEAN stop (user stop / audio channel closed) finalizes and
@@ -493,6 +502,24 @@ fn run_stream_loop(
                             &txt.committed,
                             &txt.tentative,
                             false,
+                        );
+                    }
+                    if conf_probe && last_probe.elapsed() >= Duration::from_secs(3) {
+                        last_probe = Instant::now();
+                        let t0 = Instant::now();
+                        let snap = stream.snapshot();
+                        let cost_ms = t0.elapsed().as_secs_f32() * 1000.0;
+                        let (finite, sum) = snap.tokens.iter().fold((0usize, 0.0f64), |(n, s), t| {
+                            if t.p.is_finite() {
+                                (n + 1, s + t.p as f64)
+                            } else {
+                                (n, s)
+                            }
+                        });
+                        let mean = if finite > 0 { sum / finite as f64 } else { f64::NAN };
+                        log::info!(
+                            "[LocalSTT] conf-probe: {finite}/{} tokens finite-p (mean {mean:.3}), snapshot in {cost_ms:.1}ms",
+                            snap.tokens.len()
                         );
                     }
                 }
