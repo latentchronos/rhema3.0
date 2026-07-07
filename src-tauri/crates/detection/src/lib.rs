@@ -29,8 +29,7 @@ pub use semantic::detector::SemanticDetector;
 pub use semantic::cloud::CloudBooster;
 pub use merger::{DetectionMerger, MergedDetection};
 pub use pipeline::{
-    is_control_command, parse_control_action, run_stage2_placeholder, ControlAction,
-    DetectionPipeline, IntentClass,
+    is_control_command, parse_control_action, ControlAction, DetectionPipeline, IntentClass,
 };
 pub use sentence_buffer::SentenceBuffer;
 pub use reading_mode::{ReadingMode, ReadingAdvance};
