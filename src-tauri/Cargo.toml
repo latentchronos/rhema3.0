@@ -47,6 +47,7 @@ tauri = { version = "2.10.3", features = [] }
 tauri-plugin-log = "2"
 tauri-plugin-store = "2"
 rhema-audio = { path = "crates/audio" }
+rhema-vad = { path = "crates/vad" }
 rhema-bible = { path = "crates/bible" }
 rhema-stt = { path = "crates/stt" }
 rhema-broadcast = { path = "crates/broadcast" }
@@ -61,6 +62,12 @@ base64 = "0.22"
 # STT provider. Off by default: the standard build stays cloud-only (Deepgram) and
 # pulls in no native ggml/BLAS dependency. Build with: cargo build --features local-stt
 local-stt = ["rhema-stt/local-stt"]
+
+# Neural speech-activity indicator (Silero VAD via ONNX Runtime) in place of the energy
+# VAD. Off by default so the standard build pulls no ONNX runtime for VAD; the on-device
+# `ort` is shared with rhema-detection's `onnx` feature when both are enabled. Needs
+# model/silero_vad.onnx. Build with: cargo build --features neural-vad
+neural-vad = ["rhema-vad/silero"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-global-shortcut = "2"

@@ -198,6 +198,7 @@ dependencies = [
  "rhema-broadcast",
  "rhema-detection",
  "rhema-stt",
+ "rhema-vad",
  "serde",
  "serde_json",
  "tauri",

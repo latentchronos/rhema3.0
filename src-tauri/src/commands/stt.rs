@@ -20,6 +20,98 @@ use rhema_audio::{
 };
 use rhema_stt::{DeepgramClient, SttConfig, TranscriptEvent};
 
+/// A speech-boundary transition, provider-agnostic so the fanout thread emits the same
+/// `stt_speech_started` / `stt_speech_ended` UI events regardless of which detector runs.
+#[derive(Clone, Copy)]
+enum SpeechTransition {
+    Started,
+    Ended,
+}
+
+/// The speech indicator behind the fanout thread. Either the legacy energy VAD (default,
+/// and the `neural-vad`-off build) or the Silero neural VAD (when built with the feature
+/// and its model loads). Both only drive UI events — neither gates the audio stream.
+enum SpeechDetector {
+    /// Energy RMS VAD; `None` when the user disabled the speech indicator.
+    Energy(Option<Vad>),
+    #[cfg(feature = "neural-vad")]
+    Neural {
+        vad: rhema_vad::SileroVad,
+        reblock: rhema_vad::Reblocker,
+        gate: rhema_vad::VadGate,
+    },
+}
+
+impl SpeechDetector {
+    /// Fold one (gated) capture frame in and return any speech-boundary transitions.
+    fn process(&mut self, frame: &AudioFrame) -> Vec<SpeechTransition> {
+        match self {
+            SpeechDetector::Energy(vad) => match vad.as_mut().and_then(|v| v.process(frame).transition) {
+                Some(VadTransition::SpeechStarted) => vec![SpeechTransition::Started],
+                Some(VadTransition::SpeechEnded) => vec![SpeechTransition::Ended],
+                None => vec![],
+            },
+            #[cfg(feature = "neural-vad")]
+            SpeechDetector::Neural { vad, reblock, gate } => {
+                // Silero needs 16 kHz f32 in fixed 512-sample frames; the capture stream is
+                // i16 at 16 kHz, so convert and re-block. On a per-frame inference error we
+                // log and skip — the audio itself is still forwarded to STT upstream.
+                let samples: Vec<f32> = frame.samples.iter().map(|&s| s as f32 / 32768.0).collect();
+                let mut out = Vec::new();
+                for chunk in reblock.push(&samples) {
+                    match vad.process(&chunk) {
+                        Ok(prob) => {
+                            if let Some(event) = gate.process(prob).event {
+                                out.push(match event {
+                                    rhema_vad::VadEvent::SpeechStart { .. } => SpeechTransition::Started,
+                                    rhema_vad::VadEvent::SpeechEnd { .. } => SpeechTransition::Ended,
+                                });
+                            }
+                        }
+                        Err(e) => log::warn!("[VAD] silero process failed: {e}"),
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Build the speech indicator for a capture session. Silero when the `neural-vad` feature
+/// is built AND its model loads; otherwise (feature off, load failure, or the user
+/// disabled the indicator) the energy VAD — so capture is never blocked on the model.
+fn build_speech_detector(use_vad: bool) -> SpeechDetector {
+    if !use_vad {
+        return SpeechDetector::Energy(None);
+    }
+    #[cfg(feature = "neural-vad")]
+    {
+        let model = std::env::var("RHEMA_VAD_MODEL").unwrap_or_else(|_| default_vad_model_path());
+        match rhema_vad::SileroVad::load(std::path::Path::new(&model)) {
+            Ok(vad) => {
+                log::info!("[VAD] neural (Silero) speech indicator enabled: {model}");
+                return SpeechDetector::Neural {
+                    vad,
+                    reblock: rhema_vad::Reblocker::new(),
+                    gate: rhema_vad::VadGate::new(rhema_vad::VadConfig::default()),
+                };
+            }
+            Err(e) => log::warn!("[VAD] Silero load failed ({e}); falling back to energy VAD"),
+        }
+    }
+    SpeechDetector::Energy(Some(Vad::new(VadConfig::default())))
+}
+
+/// Default Silero model path: the gitignored repo `model/` dir (one level up from the app
+/// crate). Overridable with `RHEMA_VAD_MODEL`.
+#[cfg(feature = "neural-vad")]
+fn default_vad_model_path() -> String {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../model/silero_vad.onnx")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Start the full audio-capture-to-transcription pipeline.
 ///
 /// 1. Opens the microphone via cpal (on a dedicated thread so the non-Send
@@ -138,7 +230,11 @@ pub async fn start_transcription(
             log::info!("Audio capture started on fanout thread");
 
             let mut frame_count: u64 = 0;
-            let mut vad = use_vad.then(|| Vad::new(VadConfig::default()));
+            // Speech indicator: Silero neural VAD when built `--features neural-vad` and its
+            // model loads, else the energy VAD (identical to before). Conservative wiring —
+            // it drives the UI speech-start/end events and NEVER gates the audio stream
+            // (every frame is still forwarded to STT), honouring never-drop-the-sermon.
+            let mut speech = build_speech_detector(use_vad);
             // Phase 1 hardware gating runs always, independent of the VAD toggle.
             // Kept SPEECH-SAFE (observe mode: gates measure + log but never drop)
             // until the level-invariant discriminator + per-venue calibration land
@@ -199,15 +295,14 @@ pub async fn start_transcription(
                         //     speech (e.g. when the gate's AGC under-boosts quiet
                         //     onsets). Always forwarding keeps transcription
                         //     reliable while preserving the speech indicators.
-                        if let Some(vad) = vad.as_mut() {
-                            match vad.process(&frame).transition {
-                                Some(VadTransition::SpeechStarted) => {
+                        for transition in speech.process(&frame) {
+                            match transition {
+                                SpeechTransition::Started => {
                                     let _ = fan_app.emit("stt_speech_started", ());
                                 }
-                                Some(VadTransition::SpeechEnded) => {
+                                SpeechTransition::Ended => {
                                     let _ = fan_app.emit("stt_speech_ended", ());
                                 }
-                                None => {}
                             }
                         }
                         if deepgram_tx.try_send(frame.samples).is_err() {
