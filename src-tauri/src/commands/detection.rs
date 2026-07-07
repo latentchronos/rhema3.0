@@ -28,6 +28,12 @@ pub struct DetectionResult {
     pub decision: String,
     pub explanation: String,
     pub transcript_snippet: String,
+    /// Whether this detection came from an authoritative (committed/final) transcript
+    /// rather than an unstable interim/partial. Only final detections may drive
+    /// projection (preview selection + auto-queue) on the frontend; partial detections
+    /// still populate the detections panel and operator console as preview/priming, but
+    /// never move the screen. See RHEMA_V2_ARCHITECTURE §4 (committed-only projection).
+    pub is_final: bool,
 }
 
 /// Start the service session (§2.4). Detections, voice commands, and proactive
@@ -507,6 +513,9 @@ pub fn to_result(state: &AppState, merged: &MergedDetection) -> DetectionResult 
         decision: merged.decision.decision.to_string(),
         explanation: merged.decision.explanation.clone(),
         transcript_snippet: merged.detection.transcript_snippet.clone(),
+        // Authoritative by default; the live direct path overrides this to `false` for
+        // detections derived from interim/partial transcripts.
+        is_final: true,
     }
 }
 

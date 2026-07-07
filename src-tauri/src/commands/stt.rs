@@ -432,7 +432,7 @@ pub async fn start_transcription(
                                 // Translation commands: "read in NIV", "switch to ESV"
                                 check_translation_command(&det_app, &transcript);
                                 // Direct detection: instant (regex), every is_final
-                                let direct_found = run_direct_detection(&det_app, &transcript);
+                                let direct_found = run_direct_detection(&det_app, &transcript, true);
                                 // Reading mode: does transcript match expected verse?
                                 check_reading_mode(&det_app, &transcript, direct_found);
                                 // Intent layer (Gap 2): a short voice control command
@@ -479,9 +479,11 @@ pub async fn start_transcription(
                     if !det_session.load(Ordering::SeqCst) {
                         continue;
                     }
-                    // Direct detection on partials — instant feel for verbose
-                    // forms like "Psalm chapter 2 verse 3".
-                    run_direct_detection(&det_app, &transcript);
+                    // Direct detection on partials — instant preview for verbose forms
+                    // like "Psalm chapter 2 verse 3". Tagged is_final=false: it primes the
+                    // merger/context and shows in the panel, but must not move the screen
+                    // (projection is committed-only — RHEMA_V2_ARCHITECTURE §4).
+                    run_direct_detection(&det_app, &transcript, false);
                 }
 
                 // Periodic tick: activates the sentence buffer's timeout flush
@@ -773,7 +775,9 @@ pub async fn run_stage2_worker(
                         "stage2: '{transcript}' → {reference} (confidence {:.2})",
                         res.confidence
                     );
-                    run_direct_detection(&app, &reference);
+                    // Stage-2 resolves an ambiguous (already-final) utterance to a
+                    // concrete reference — authoritative, may project.
+                    run_direct_detection(&app, &reference, true);
                 }
             }
             Ok(_) => log::debug!("stage2: '{transcript}' not scripture"),
@@ -782,7 +786,15 @@ pub async fn run_stage2_worker(
     }
 }
 
-fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
+/// Run direct (regex/automaton) scripture detection over `transcript`.
+///
+/// `is_final` marks whether the text is authoritative (committed/final) or an unstable
+/// interim/partial. Both run detection — partials give the operator an instant preview and
+/// prime the merger/sermon-context — but only `is_final` detections are allowed to drive
+/// projection (preview selection + auto-queue) on the frontend. Partial detections are
+/// tagged `is_final = false` so the frontend shows them in the panel/operator console
+/// without moving the screen. See RHEMA_V2_ARCHITECTURE §4 (committed-only projection).
+fn run_direct_detection(app: &AppHandle, transcript: &str, is_final: bool) -> bool {
     use rhema_detection::{DetectionMerger, DirectDetector};
 
     let epoch_at_detection = app.state::<EpochLock>().current();
@@ -847,6 +859,7 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
                         decision: m.decision.decision.to_string(),
                         explanation: m.decision.explanation.clone(),
                         transcript_snippet: m.detection.transcript_snippet.clone(),
+                        is_final,
                     }
                 })
                 .collect();
@@ -861,10 +874,15 @@ fn run_direct_detection(app: &AppHandle, transcript: &str) -> bool {
             return has_high_confidence;
         }
     };
-    let results: Vec<super::detection::DetectionResult> = merged
+    let mut results: Vec<super::detection::DetectionResult> = merged
         .iter()
         .map(|m| super::detection::to_result(&app_state, m))
         .collect();
+    // to_result defaults is_final=true; tag with the actual finality of this transcript
+    // so partial-derived detections can't drive projection on the frontend.
+    for r in &mut results {
+        r.is_final = is_final;
+    }
 
     // Update sermon context with direct detection results
     for m in &merged {
@@ -1234,6 +1252,8 @@ fn check_reading_mode(app: &AppHandle, transcript: &str, direct_found: bool) {
             decision,
             explanation,
             transcript_snippet: String::new(),
+            // Reading-mode advance fires on committed/final transcripts only.
+            is_final: true,
         };
         emit_detections(app, "contextual", vec![result], epoch_at_detection);
     }
@@ -1354,6 +1374,8 @@ fn run_quotation_matching(app: &AppHandle, transcript: &str) {
                 decision,
                 explanation,
                 transcript_snippet: d.transcript_snippet.clone(),
+                // Quotation matching runs on committed/final transcripts only.
+                is_final: true,
             }
         })
         .collect();

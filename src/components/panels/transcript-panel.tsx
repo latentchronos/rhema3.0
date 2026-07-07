@@ -84,13 +84,17 @@ export function TranscriptPanel() {
   useTauriEvent<DetectionResult[]>("verse_detections", (detections) => {
     useDetectionStore.getState().addDetections(detections)
 
-    // Auto-navigate book search + select verse for preview/live
-    // Handle direct, contextual (reading mode), and high-confidence quotation matches
+    // Auto-navigate book search + select verse for preview/live.
+    // Handle direct, contextual (reading mode), and high-confidence quotation matches.
+    // Committed-only projection (RHEMA_V2_ARCHITECTURE §4): only authoritative
+    // (is_final) detections may move the preview/live panels. Partial-derived detections
+    // still show in the panel below (addDetections above) but never drive selection.
     const directHit = detections.find(
       (d) =>
-        d.source === "direct" ||
-        d.source === "contextual" ||
-        (d.source === "quotation" && d.auto_queued)
+        d.is_final &&
+        (d.source === "direct" ||
+          d.source === "contextual" ||
+          (d.source === "quotation" && d.auto_queued))
     )
     if (directHit && directHit.book_number > 0) {
       // Select verse immediately so preview/live panels update
@@ -112,9 +116,9 @@ export function TranscriptPanel() {
       })
     }
 
-    // Auto-queue high-confidence detections
+    // Auto-queue high-confidence detections — committed/final only, never from partials.
     for (const d of detections) {
-      if (d.auto_queued) {
+      if (d.auto_queued && d.is_final) {
         useQueueStore.getState().addItem({
           id: crypto.randomUUID(),
           verse: {

@@ -506,6 +506,7 @@ mod tests {
             decision: "surfaced".to_string(),
             explanation: String::new(),
             transcript_snippet: String::new(),
+            is_final: true,
         };
         let mapped = to_channel_detection(&app_detection);
         assert_eq!(mapped.verse.book, "Romans");

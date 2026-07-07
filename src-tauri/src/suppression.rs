@@ -131,6 +131,7 @@ mod tests {
             decision: String::new(),
             explanation: String::new(),
             transcript_snippet: String::new(),
+            is_final: true,
         }
     }
 
