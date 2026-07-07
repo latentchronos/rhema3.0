@@ -74,3 +74,12 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.transcribe-cpp-sys]
 opt-level = 3
+# The audio gate (feedback/flux/variance per window) and the verse detector (scans
+# ~31k verses on every emit) are the other two real-time hot paths. Unoptimized they
+# burn CPU on the same cores the streaming model needs, starving its headroom. Optimize
+# them in dev too so the model keeps its cores — this is what lets the low-lookahead
+# streaming config stay ahead of real time.
+[profile.dev.package.rhema-audio]
+opt-level = 3
+[profile.dev.package.rhema-detection]
+opt-level = 3
