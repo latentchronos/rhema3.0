@@ -4269,6 +4269,7 @@ dependencies = [
  "futures-util",
  "log",
  "reqwest 0.12.28",
+ "rhema-transcript",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -4276,6 +4277,13 @@ dependencies = [
  "tokio-tungstenite",
  "transcribe-cpp",
  "url",
+]
+
+[[package]]
+name = "rhema-transcript"
+version = "0.1.0"
+dependencies = [
+ "log",
 ]
 
 [[package]]

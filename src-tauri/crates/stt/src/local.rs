@@ -40,6 +40,8 @@ use transcribe_cpp::{
     StreamExtension, StreamOptions, StreamState, TimestampKind,
 };
 
+use rhema_transcript::{StreamCommitter, TranscriptSegment};
+
 use crate::engine::SttEngine;
 use crate::error::SttError;
 use crate::types::TranscriptEvent;
@@ -78,14 +80,6 @@ const PREROLL: usize = SR / 2;
 /// per-partial cost flat so the engine stays ahead of the mic. The Final still encodes
 /// the whole utterance for an accurate committed line.
 const PARTIAL_WINDOW: usize = SR * 8 / 5;
-/// Streaming only: flush a run of committed-but-not-yet-finalized text as a `Final` once
-/// it exceeds this many chars, even without sentence punctuation. The streaming model
-/// rarely emits periods, so otherwise the un-finalized remainder grows without bound and
-/// every `Partial` re-sends the whole thing — making the verse detector re-scan the entire
-/// transcript on every tick (the flood of repeated `Found`/`suppressed` lines). Committed
-/// text is append-only and stable, so finalizing it early is safe; it just means the
-/// detector sees each chunk once instead of on every update.
-const COMMIT_FLUSH_CHARS: usize = 80;
 
 // ── Streaming auto-recovery (Rhema v2, Phase 1) ─────────────────────────────
 // A live sermon cannot tolerate "transcription stopped and won't come back". When the
@@ -395,11 +389,12 @@ fn run_stream_loop(
         );
     }
 
-    // Cross-restart state. `final_upto` is a byte offset into the CURRENT stream's
-    // committed prefix already emitted as `Final`; it resets to 0 whenever we recreate the
-    // stream (a fresh stream starts with empty committed text). `preroll` retains the most
-    // recent audio so a recovered stream can warm its encoder cache.
-    let mut final_upto = 0usize;
+    // Cross-restart state. `committer` (rhema-transcript) turns each committed/tentative
+    // snapshot into Final/Partial segments and tracks how far into committed has been
+    // finalized; it resets whenever we recreate the stream (a fresh stream starts with
+    // empty committed text). `preroll` retains the most recent audio so a recovered stream
+    // can warm its encoder cache.
+    let mut committer = StreamCommitter::new();
     let mut meter = BacklogMeter::new();
     let mut preroll: VecDeque<f32> = VecDeque::with_capacity(PREROLL_RECOVER);
     let mut restart_attempts: u32 = 0;
@@ -442,12 +437,12 @@ fn run_stream_loop(
                 "[LocalSTT] streaming mode ({n_threads} threads, lang={lang}, att_right={att_right}), model {model_path}"
             );
         } else {
-            // Recovery path. A fresh stream's committed prefix is empty, so the emitted
-            // offset resets. Warm the new stream's encoder cache with the recent pre-roll,
-            // but do NOT re-emit it — advance `final_upto` past whatever the replay commits
-            // so recovery stays loss-tolerant (it may drop the ~1s in flight at the fault)
+            // Recovery path. A fresh stream's committed prefix is empty, so the committer
+            // resets. Warm the new stream's encoder cache with the recent pre-roll, but do
+            // NOT re-emit it — skip the committer past whatever the replay commits so
+            // recovery stays loss-tolerant (it may drop the ~1s in flight at the fault)
             // rather than duplicate-prone. An informational Error tells the UI we recovered.
-            final_upto = 0;
+            committer.reset();
             let _ = event_tx.blocking_send(TranscriptEvent::Error(
                 "local STT recovered from a stream fault".to_string(),
             ));
@@ -459,7 +454,7 @@ fn run_stream_loop(
                 );
                 if stream.feed(&pr).is_ok() {
                     // Skip re-emitting the replayed transcript.
-                    final_upto = stream.text().committed.len();
+                    committer.skip_to(stream.text().committed.len());
                 }
             }
         }
@@ -494,9 +489,9 @@ fn run_stream_loop(
                         let txt = stream.text();
                         emit_stream_text(
                             &event_tx,
+                            &mut committer,
                             &txt.committed,
                             &txt.tentative,
-                            &mut final_upto,
                             false,
                         );
                     }
@@ -510,7 +505,7 @@ fn run_stream_loop(
             // Clean stop: flush and emit the tail as a Final, then exit the lifecycle.
             if stream.finalize().is_ok() {
                 let txt = stream.text();
-                emit_stream_text(&event_tx, &txt.committed, &txt.tentative, &mut final_upto, true);
+                emit_stream_text(&event_tx, &mut committer, &txt.committed, &txt.tentative, true);
             }
             break 'session;
         }
@@ -542,90 +537,26 @@ fn run_stream_loop(
     Ok(())
 }
 
-/// Turn a streaming snapshot into events: newly-completed committed sentences become
-/// `Final`s; the remaining committed tail + `tentative` is the live `Partial`. On
-/// `flush`, the whole remainder is emitted as a final `Final`. `final_upto` tracks how
-/// much of `committed` has already been finalized (committed is append-only).
+/// Drive the [`StreamCommitter`] with a streaming snapshot and emit the resulting segments.
+///
+/// The committer (rhema-transcript) owns the committed/tentative → Final/Partial contract
+/// and the endpoint policy (`<EOU>`/`<EOB>`, punctuation, char-count safety flush). Streaming
+/// Finals don't yet carry per-word timing/confidence — the streaming snapshot's words would
+/// need committed-token alignment (deferred to the confidence-gated projection step); until
+/// then they finalize with unknown confidence (1.0).
 fn emit_stream_text(
     event_tx: &mpsc::Sender<TranscriptEvent>,
+    committer: &mut StreamCommitter,
     committed: &str,
     tentative: &str,
-    final_upto: &mut usize,
     flush: bool,
 ) {
-    // Offsets are tracked against the RAW committed string (append-only, stable), so
-    // tag-stripping — which changes byte lengths — is applied only to emitted text.
-    let upto = (*final_upto).min(committed.len());
-
-    // Emit each completed phrase in the newly-committed region as its own Final, cutting at
-    // the model's own end-of-utterance token *or* sentence punctuation (whichever comes
-    // first). Streaming Finals don't yet carry per-word timing/confidence — the streaming
-    // snapshot's words would need committed-token alignment (deferred to the confidence-
-    // gated projection step); until then these finalize with unknown confidence (1.0).
-    let mut cut = upto;
-    while let Some(end) = next_boundary(committed, cut) {
-        let seg = strip_tags(&committed[cut..end]);
-        let seg = seg.trim();
-        if !seg.is_empty() {
-            send_final(event_tx, seg.to_string(), Vec::new(), 1.0);
-        }
-        cut = end;
-    }
-
-    // If a long run of committed text carries no sentence punctuation, flush it as a Final
-    // anyway (broken at the last word boundary so no word is split). This keeps the live
-    // Partial — and the detector that re-scans it every tick — from ever carrying an
-    // unbounded, ever-growing remainder. Committed text is stable, so this is lossless.
-    while committed.len().saturating_sub(cut) > COMMIT_FLUSH_CHARS {
-        match committed[cut..].rfind(' ') {
-            Some(rel) if rel > 0 => {
-                let boundary = cut + rel + 1;
-                let seg = strip_tags(&committed[cut..boundary]);
-                let seg = seg.trim();
-                if !seg.is_empty() {
-                    send_final(event_tx, seg.to_string(), Vec::new(), 1.0);
-                }
-                cut = boundary;
-            }
-            // One unbroken token longer than the cap — nothing safe to split on yet.
-            _ => break,
+    for seg in committer.advance(committed, tentative, flush) {
+        match seg {
+            TranscriptSegment::Final(text) => send_final(event_tx, text, Vec::new(), 1.0),
+            TranscriptSegment::Partial(text) => send_partial(event_tx, text),
         }
     }
-    *final_upto = cut;
-
-    let remainder = strip_tags(&format!("{}{}", &committed[cut..], tentative));
-    let remainder = remainder.trim();
-    if flush {
-        if !remainder.is_empty() {
-            send_final(event_tx, remainder.to_string(), Vec::new(), 1.0);
-        }
-    } else if !remainder.is_empty() {
-        send_partial(event_tx, remainder.to_string());
-    }
-}
-
-/// Byte index just past the next hard phrase boundary at or after `from`: either an
-/// end-of-utterance / end-of-burst control token (`<EOU>`/`<EOB>`) the streaming model
-/// emits, or sentence-ending punctuation — whichever comes first. Using the model's own
-/// `<EOU>` as a boundary (this model rarely emits periods) is what lets a committed phrase
-/// finalize promptly, instead of waiting for the `COMMIT_FLUSH_CHARS` char-count safety net
-/// that previously did the endpointing. The tag itself is stripped from emitted text by
-/// [`strip_tags`]; here we only use its position as the cut point.
-fn next_boundary(s: &str, from: usize) -> Option<usize> {
-    let hay = &s[from..];
-    [
-        hay.find(['.', '?', '!']).map(|rel| from + rel + 1),
-        hay.find("<EOU>").map(|rel| from + rel + "<EOU>".len()),
-        hay.find("<EOB>").map(|rel| from + rel + "<EOB>".len()),
-    ]
-    .into_iter()
-    .flatten()
-    .min()
-}
-
-/// Drop end-of-utterance / end-of-burst control tokens the model may surface.
-fn strip_tags(s: &str) -> String {
-    s.replace("<EOU>", "").replace("<EOB>", "")
 }
 
 /// Run offline transcription over `pcm`. When `want_words` is set, request word
@@ -804,25 +735,5 @@ mod tests {
         let (mapped, overall) = map_words(&words, &tokens);
         assert_eq!(mapped[0].confidence, 1.0);
         assert_eq!(overall, 1.0); // no finite p anywhere → trust, don't reject
-    }
-
-    #[test]
-    fn next_boundary_cuts_at_eou_before_punctuation() {
-        let s = "turn to john <EOU> three sixteen.";
-        let end = next_boundary(s, 0).unwrap();
-        assert_eq!(&s[..end], "turn to john <EOU>");
-        assert_eq!(strip_tags(&s[..end]).trim(), "turn to john");
-    }
-
-    #[test]
-    fn next_boundary_cuts_at_punctuation_when_no_tag() {
-        let s = "hello world. and more";
-        let end = next_boundary(s, 0).unwrap();
-        assert_eq!(&s[..end], "hello world.");
-    }
-
-    #[test]
-    fn next_boundary_none_when_no_boundary() {
-        assert!(next_boundary("no boundary yet", 0).is_none());
     }
 }

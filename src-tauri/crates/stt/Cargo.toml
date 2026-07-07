@@ -15,6 +15,7 @@ url = "2"
 futures-util = "0.3"
 crossbeam-channel = "0.5"
 async-trait = "0.1"
+rhema-transcript = { path = "../transcript" }
 # On-device GGUF STT runtime (ggml). Optional; CPU-only (default `metal` feature off).
 transcribe-cpp = { version = "0.1.0", default-features = false, optional = true }
 

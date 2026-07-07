@@ -3,6 +3,7 @@ members = [
     ".",
     "crates/audio",
     "crates/vad",
+    "crates/transcript",
     "crates/stt",
     "crates/bible",
     "crates/detection",
