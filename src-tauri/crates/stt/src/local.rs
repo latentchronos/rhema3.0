@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use crossbeam_channel::Receiver;
 use tokio::sync::mpsc;
 use transcribe_cpp::{
-    CommitPolicy, Model, ParakeetStreamOptions, RunOptions, Session, SessionOptions,
+    CommitPolicy, Model, ParakeetStreamOptions, RunOptions, Session, SessionOptions, Stream,
     StreamExtension, StreamOptions, StreamState, TimestampKind,
 };
 
@@ -99,6 +99,10 @@ const STREAM_HEALTHY_RESET: Duration = Duration::from_secs(30);
 /// so the first post-recovery words aren't cold-start garbage (~1s). Replayed audio is
 /// NOT re-emitted (final_upto is advanced past it), so recovery never duplicates text.
 const PREROLL_RECOVER: usize = SR;
+/// Streaming confidence window: mean per-token `p` over the last this-many ms of committed
+/// audio is the ASR confidence attached to a Final. Recent-window (not whole-transcript) so
+/// a genuinely bad patch of audio actually pulls the value down toward the projection gate.
+const CONF_WINDOW_MS: i64 = 3000;
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -499,6 +503,7 @@ fn run_stream_loop(
                         emit_stream_text(
                             &event_tx,
                             &mut committer,
+                            &stream,
                             &txt.committed,
                             &txt.tentative,
                             false,
@@ -532,7 +537,7 @@ fn run_stream_loop(
             // Clean stop: flush and emit the tail as a Final, then exit the lifecycle.
             if stream.finalize().is_ok() {
                 let txt = stream.text();
-                emit_stream_text(&event_tx, &mut committer, &txt.committed, &txt.tentative, true);
+                emit_stream_text(&event_tx, &mut committer, &stream, &txt.committed, &txt.tentative, true);
             }
             break 'session;
         }
@@ -567,22 +572,60 @@ fn run_stream_loop(
 /// Drive the [`StreamCommitter`] with a streaming snapshot and emit the resulting segments.
 ///
 /// The committer (rhema-transcript) owns the committed/tentative → Final/Partial contract
-/// and the endpoint policy (`<EOU>`/`<EOB>`, punctuation, char-count safety flush). Streaming
-/// Finals don't yet carry per-word timing/confidence — the streaming snapshot's words would
-/// need committed-token alignment (deferred to the confidence-gated projection step); until
-/// then they finalize with unknown confidence (1.0).
+/// and the endpoint policy (`<EOU>`/`<EOB>`, punctuation, char-count safety flush). When a
+/// Final is produced we attach a real ASR confidence — the mean per-token `p` over the last
+/// [`CONF_WINDOW_MS`] of committed audio (nemotron populates `p`; recent-window so a bad
+/// patch actually moves it). Snapshotting only when finalizing keeps its O(total tokens)
+/// cost at a per-phrase cadence, not per-feed. Streaming Finals still carry no per-WORD
+/// timing (that alignment remains deferred); this is per-SEGMENT confidence, which is what
+/// the projection gate consumes.
 fn emit_stream_text(
     event_tx: &mpsc::Sender<TranscriptEvent>,
     committer: &mut StreamCommitter,
+    stream: &Stream,
     committed: &str,
     tentative: &str,
     flush: bool,
 ) {
-    for seg in committer.advance(committed, tentative, flush) {
+    let segments = committer.advance(committed, tentative, flush);
+    // Compute confidence once, and only when there's a Final to attach it to.
+    let confidence = if segments
+        .iter()
+        .any(|s| matches!(s, TranscriptSegment::Final(_)))
+    {
+        committed_window_confidence(stream)
+    } else {
+        1.0
+    };
+    for seg in segments {
         match seg {
-            TranscriptSegment::Final(text) => send_final(event_tx, text, Vec::new(), 1.0),
+            TranscriptSegment::Final(text) => send_final(event_tx, text, Vec::new(), confidence),
             TranscriptSegment::Partial(text) => send_partial(event_tx, text),
         }
+    }
+}
+
+/// Recent-window ASR confidence: mean per-token `p` over the last [`CONF_WINDOW_MS`] of
+/// committed audio. Snapshots the stream (materializes all tokens) and delegates the pure
+/// windowing to [`window_mean_p`].
+fn committed_window_confidence(stream: &Stream) -> f64 {
+    window_mean_p(&stream.snapshot().tokens)
+}
+
+/// Mean per-token `p` over the last [`CONF_WINDOW_MS`] (by `t1_ms`). `1.0` when the model
+/// provides no `p` (all NaN) or there are no recent tokens — so "no confidence signal"
+/// reads as "trust", never "reject". Pure; unit-tested.
+fn window_mean_p(tokens: &[transcribe_cpp::Token]) -> f64 {
+    let max_t1 = tokens.iter().map(|t| t.t1_ms).max().unwrap_or(0);
+    let cutoff = max_t1 - CONF_WINDOW_MS;
+    let (n, sum) = tokens
+        .iter()
+        .filter(|t| t.t1_ms >= cutoff && t.p.is_finite())
+        .fold((0usize, 0.0f64), |(n, s), t| (n + 1, s + t.p as f64));
+    if n > 0 {
+        sum / n as f64
+    } else {
+        1.0
     }
 }
 
@@ -728,6 +771,14 @@ mod tests {
         }
     }
 
+    fn tok_at(t1_ms: i64, p: f32) -> transcribe_cpp::Token {
+        transcribe_cpp::Token {
+            t1_ms,
+            p,
+            ..Default::default()
+        }
+    }
+
     fn word(text: &str, t0: i64, t1: i64, first_token: i32, n_tokens: i32) -> transcribe_cpp::Word {
         transcribe_cpp::Word {
             t0_ms: t0,
@@ -762,5 +813,27 @@ mod tests {
         let (mapped, overall) = map_words(&words, &tokens);
         assert_eq!(mapped[0].confidence, 1.0);
         assert_eq!(overall, 1.0); // no finite p anywhere → trust, don't reject
+    }
+
+    #[test]
+    fn window_mean_p_averages_only_recent_finite_tokens() {
+        // CONF_WINDOW_MS = 3000; max_t1 = 10000 → cutoff 7000.
+        let tokens = vec![
+            tok_at(1000, 0.10),  // old → excluded
+            tok_at(8000, 0.90),  // in window
+            tok_at(9000, 0.80),  // in window
+            tok_at(10000, 0.70), // in window
+        ];
+        let m = window_mean_p(&tokens);
+        assert!((m - 0.8).abs() < 1e-6, "mean(0.9,0.8,0.7) expected, got {m}");
+    }
+
+    #[test]
+    fn window_mean_p_trusts_when_no_finite_p_or_empty() {
+        assert_eq!(window_mean_p(&[]), 1.0);
+        assert_eq!(
+            window_mean_p(&[tok_at(1000, f32::NAN), tok_at(2000, f32::NAN)]),
+            1.0
+        );
     }
 }
