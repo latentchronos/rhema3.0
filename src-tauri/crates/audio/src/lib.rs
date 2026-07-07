@@ -2,6 +2,7 @@ pub mod types;
 pub mod error;
 pub mod device;
 pub mod meter;
+pub mod resample;
 pub mod capture;
 pub mod vad;
 pub mod flux_gate;

@@ -10,3 +10,6 @@ log.workspace = true
 thiserror.workspace = true
 cpal = "0.15"
 crossbeam-channel = "0.5"
+# Anti-aliased sample-rate conversion (device rate -> 16 kHz). The 0.15 line keeps the
+# simple SincFixedIn + Vec-based process() API; 0.16 switched to audioadapter buffers.
+rubato = "0.15"
