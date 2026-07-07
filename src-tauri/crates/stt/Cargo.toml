@@ -22,3 +22,8 @@ transcribe-cpp = { version = "0.1.0", default-features = false, optional = true 
 default = ["rest-fallback"]
 rest-fallback = ["reqwest"]
 local-stt = ["dep:transcribe-cpp"]
+
+# Runtime smoke test for the local native paths (needs the GGUF models + ggml).
+[[example]]
+name = "smoke"
+required-features = ["local-stt"]
