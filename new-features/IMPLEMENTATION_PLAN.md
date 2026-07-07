@@ -49,7 +49,9 @@ pipeline. Each phase touches a distinct layer.
 
 Replace assumptions with ground truth before any phase begins.
 
-- [ ] Verify workspace matches GEMINI.md (8 crates, paths, `rhema-api`/`rhema-notes` are stubs).
+- [ ] Verify workspace matches GEMINI.md crate layout. NOTE (RhemaV2): `rhema-api` is no
+      longer a stub — it's the multi-provider Stage-2 LLM client (`rhema-api/src/llm/`); and
+      the workspace now also has `rhema-vad` + `rhema-transcript`.
 - [ ] Run `cargo test --workspace` → confirm the **128-test baseline is green** before touching anything.
 - [ ] Read the real entry points each companion references and record interface gaps as explicit "ask"/"decision" items:
   - `audio/src/capture.rs` pipeline ordering (resample → gain → RMS → VAD → forward)

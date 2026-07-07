@@ -1,5 +1,13 @@
 # Rhema 3.0 — Feature & Architecture Docs
 
+> **⚠️ Current work is RhemaV2 — see [`RHEMA_V2_ARCHITECTURE.md`](RHEMA_V2_ARCHITECTURE.md).**
+> The documents below (`ARCHITECTURE.md`, `TRACEABILITY.md`, `IMPLEMENTATION_PLAN.md`) are the
+> **Gen-2 planning record** and are partly behind the code. Known items they still describe as
+> pending that are actually **shipped**: the **Stage-2 LLM** fallback (now a full multi-provider
+> client — Anthropic/OpenAI/Gemini — in `rhema-api/src/llm/`, so `rhema-api` is **not** a stub),
+> and much of Phase 1/2 (streaming ASR hardening, Silero VAD, resampler, confidence gating).
+> Treat the Gen-2 docs as vision/history; the RhemaV2 blueprint's §10 roadmap has live status.
+
 This folder holds the architecture vision and the 5-phase hardening roadmap that layers onto
 the existing `audio → stt → detection → broadcast` pipeline. The documents are now a single,
 internally consistent set — read them in this order.

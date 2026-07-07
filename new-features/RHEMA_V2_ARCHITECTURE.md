@@ -309,28 +309,32 @@ anywhere; document the latency expectation honestly.
 
 ## 10. Implementation Roadmap
 
-### Phase 1 — Production Foundation (reliability + correctness; ship as a unit)
+> **Progress (branch `RhemaV2`, not yet merged to `main`):** Phase 1 complete; Phase 2
+> largely complete. Status + commit per task below. All verified by unit tests + two
+> runtime smokes (STT native paths, Silero ONNX); live mic→UI validation is the user's.
 
-| Task | Files | Difficulty | Depends on | Impact |
-|---|---|---|---|---|
-| **ASR auto-recovery on `Failed`** | `stt/local.rs`, `rhema-runtime` | Med | — | **Stops mid-service death.** #1. |
-| Anti-aliased resampler | `audio/capture.rs` (+rubato) | Low | — | WER drop, esp. accents. |
-| Wire `Token.p` + `Word.t0/t1` | `stt/local.rs`, `asr::Word` | Low-Med | — | Un-blinds confidence gating. |
-| `<EOU>` endpoint, drop char-flush | `stt/local.rs` | Low | — | Correct phrase boundaries. |
-| Enforce committed-only projection | `stt.rs`, rhema-transcript | Low | timestamps | **Kills false triggers.** |
-| Stream default = streaming | `stt/local.rs` | Low | — | No rewriting partials. |
+### Phase 1 — Production Foundation — ✅ COMPLETE
 
-### Phase 2 — Streaming Intelligence
+| Task | Status | Files | Impact |
+|---|---|---|---|
+| **ASR auto-recovery on `Failed`** | ✅ `5977a14` | `stt/local.rs` | Stops mid-service death — stream recreates instead of dying. |
+| Anti-aliased resampler | ✅ `fae7ac7` | `audio/capture.rs` (rubato) | Kills the aliasing WER tax; supra-Nyquist rejection tested. |
+| Wire `Token.p` + `Word.t0/t1` | ✅ `9fc0caa` | `stt/local.rs` | Un-blinds the pace estimator (offline); confirmed live. |
+| `<EOU>` endpoint, drop char-flush | ✅ `9fc0caa` | `stt/local.rs` → `rhema-transcript` | Model-driven phrase boundaries. |
+| Enforce committed-only projection | ✅ `a209543` | `commands/stt.rs` + frontend (`is_final`) | Kills false triggers from unstable partials. |
+| Stream default = streaming | ⏸ per-deployment | `stt/local.rs` | Left a config decision (`att_right=13` floor on the i5). |
 
-| Task | Files | Difficulty | Depends on | Impact |
-|---|---|---|---|---|
-| `rhema-vad` (Silero + context + hysteresis) | new crate | Med | resampler | Robust gating/endpointing. |
-| Retire energy VAD + flux/variance gating | `audio/vad.rs`, `gate_chain.rs` | Low | rhema-vad | Removes 3 redundant heuristics. |
-| Extract `rhema-transcript` state manager | from `stt.rs` | Med | Phase 1 | Testable trust boundary. |
-| Confidence-gated scripture projection | `detection/merger.rs` | Med | timestamps | Fewer low-conf projections. |
-| Activate `normalize_transcript` | `detection/normalizer.rs` | Low | — | Applies accent fixes. |
-| Wire real Stage-2 LLM | `detection/pipeline.rs`, `rhema-api` | Med | api key plumbing | Ambiguous-intent fallback. |
-| Fixed ASR feed cadence + supervisor health UI | rhema-runtime | Med | Phase 1 | Deterministic latency, visible health. |
+### Phase 2 — Streaming Intelligence — largely complete
+
+| Task | Status | Files | Impact |
+|---|---|---|---|
+| `rhema-vad` (Silero + context + hysteresis) | ✅ `43649f8`,`c7b8360`,`34cc882` | new crate + capture wiring (`neural-vad`) | Neural VAD front-end; conservative (non-gating) first wiring, verified loading live. |
+| Retire energy VAD + flux/variance gating | ⏳ deferred | `audio/vad.rs`, `gate_chain.rs` | Aggressive consolidation — deferred pending real-audio validation. |
+| Extract `rhema-transcript` state manager | ✅ `15c9b69` | new crate (streaming committer) | Testable committed/tentative + endpoint contract. |
+| Confidence-gated scripture projection | ✅ `da820db`,`5f54b8d` | `commands/stt.rs` + streaming confidence | Low-conf finals stay review-only; **live on the streaming engine** (real per-segment `p`). |
+| Activate `normalize_transcript` | ⏸ intentionally NOT wired | `detection/normalizer.rs` | Unconditional homophones (e.g. `roaming→Romans`) corrupt normal speech — needs a context-gated variant first. |
+| Wire real Stage-2 LLM | ✅ already shipped | `rhema-api/llm/*`, `commands/stt.rs::run_stage2_worker` | Multi-provider (Anthropic/OpenAI/Gemini). Dead placeholder removed (`5fdeb1f`). |
+| Fixed ASR feed cadence + supervisor health UI | ⏳ not started | rhema-runtime | Deterministic latency, visible per-stage health. |
 
 ### Phase 3 — Advanced
 
