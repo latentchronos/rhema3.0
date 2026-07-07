@@ -37,7 +37,7 @@ use crossbeam_channel::Receiver;
 use tokio::sync::mpsc;
 use transcribe_cpp::{
     CommitPolicy, Model, ParakeetStreamOptions, RunOptions, Session, SessionOptions,
-    StreamExtension, StreamOptions, StreamState,
+    StreamExtension, StreamOptions, StreamState, TimestampKind,
 };
 
 use crate::engine::SttEngine;
@@ -282,8 +282,8 @@ fn run_loop(
                     && (silence >= SILENCE_HANG || utter.len() >= MAX_UTTERANCE)
                 {
                     // Utterance boundary → transcribe and commit.
-                    if let Some(text) = transcribe(&mut session, &utter) {
-                        send_final(&event_tx, text);
+                    if let Some((text, words, conf)) = transcribe(&mut session, &utter, true) {
+                        send_final(&event_tx, text, words, conf);
                     }
                     utter.clear();
                     had_speech = false;
@@ -293,7 +293,7 @@ fn run_loop(
                     // Live preview: re-encode only the recent window, not the whole
                     // utterance, so per-partial cost stays flat and the engine keeps up.
                     let start = utter.len().saturating_sub(PARTIAL_WINDOW);
-                    if let Some(text) = transcribe(&mut session, &utter[start..]) {
+                    if let Some((text, _, _)) = transcribe(&mut session, &utter[start..], false) {
                         send_partial(&event_tx, text);
                     }
                     since_partial = 0;
@@ -306,8 +306,8 @@ fn run_loop(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Idle: if we have buffered speech, flush it as a final utterance.
                 if had_speech && utter.len() >= MIN_SPEECH {
-                    if let Some(text) = transcribe(&mut session, &utter) {
-                        send_final(&event_tx, text);
+                    if let Some((text, words, conf)) = transcribe(&mut session, &utter, true) {
+                        send_final(&event_tx, text, words, conf);
                     }
                     utter.clear();
                     had_speech = false;
@@ -321,8 +321,8 @@ fn run_loop(
 
     // Flush any trailing speech on stop.
     if had_speech && utter.len() >= MIN_SPEECH {
-        if let Some(text) = transcribe(&mut session, &utter) {
-            send_final(&event_tx, text);
+        if let Some((text, words, conf)) = transcribe(&mut session, &utter, true) {
+            send_final(&event_tx, text, words, conf);
         }
     }
 
@@ -557,13 +557,17 @@ fn emit_stream_text(
     // tag-stripping — which changes byte lengths — is applied only to emitted text.
     let upto = (*final_upto).min(committed.len());
 
-    // Emit each completed sentence in the newly-committed region as its own Final.
+    // Emit each completed phrase in the newly-committed region as its own Final, cutting at
+    // the model's own end-of-utterance token *or* sentence punctuation (whichever comes
+    // first). Streaming Finals don't yet carry per-word timing/confidence — the streaming
+    // snapshot's words would need committed-token alignment (deferred to the confidence-
+    // gated projection step); until then these finalize with unknown confidence (1.0).
     let mut cut = upto;
-    while let Some(end) = next_sentence_end(committed, cut) {
+    while let Some(end) = next_boundary(committed, cut) {
         let seg = strip_tags(&committed[cut..end]);
         let seg = seg.trim();
         if !seg.is_empty() {
-            send_final(event_tx, seg.to_string());
+            send_final(event_tx, seg.to_string(), Vec::new(), 1.0);
         }
         cut = end;
     }
@@ -579,7 +583,7 @@ fn emit_stream_text(
                 let seg = strip_tags(&committed[cut..boundary]);
                 let seg = seg.trim();
                 if !seg.is_empty() {
-                    send_final(event_tx, seg.to_string());
+                    send_final(event_tx, seg.to_string(), Vec::new(), 1.0);
                 }
                 cut = boundary;
             }
@@ -593,18 +597,30 @@ fn emit_stream_text(
     let remainder = remainder.trim();
     if flush {
         if !remainder.is_empty() {
-            send_final(event_tx, remainder.to_string());
+            send_final(event_tx, remainder.to_string(), Vec::new(), 1.0);
         }
     } else if !remainder.is_empty() {
         send_partial(event_tx, remainder.to_string());
     }
 }
 
-/// Byte index just past the next sentence-ending punctuation at or after `from`.
-fn next_sentence_end(s: &str, from: usize) -> Option<usize> {
-    s[from..]
-        .find(['.', '?', '!'])
-        .map(|rel| from + rel + 1)
+/// Byte index just past the next hard phrase boundary at or after `from`: either an
+/// end-of-utterance / end-of-burst control token (`<EOU>`/`<EOB>`) the streaming model
+/// emits, or sentence-ending punctuation — whichever comes first. Using the model's own
+/// `<EOU>` as a boundary (this model rarely emits periods) is what lets a committed phrase
+/// finalize promptly, instead of waiting for the `COMMIT_FLUSH_CHARS` char-count safety net
+/// that previously did the endpointing. The tag itself is stripped from emitted text by
+/// [`strip_tags`]; here we only use its position as the cut point.
+fn next_boundary(s: &str, from: usize) -> Option<usize> {
+    let hay = &s[from..];
+    [
+        hay.find(['.', '?', '!']).map(|rel| from + rel + 1),
+        hay.find("<EOU>").map(|rel| from + rel + "<EOU>".len()),
+        hay.find("<EOB>").map(|rel| from + rel + "<EOB>".len()),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 /// Drop end-of-utterance / end-of-burst control tokens the model may surface.
@@ -612,16 +628,34 @@ fn strip_tags(s: &str) -> String {
     s.replace("<EOU>", "").replace("<EOB>", "")
 }
 
-/// Run offline transcription over `pcm`, returning trimmed non-empty text.
-fn transcribe(session: &mut Session, pcm: &[f32]) -> Option<String> {
-    match session.run(pcm, &RunOptions::default()) {
+/// Run offline transcription over `pcm`. When `want_words` is set, request word
+/// timestamps and return them alongside a real confidence (from token `p`); previews pass
+/// `false` to stay cheap (text only). Returns `(text, words, confidence)`.
+fn transcribe(
+    session: &mut Session,
+    pcm: &[f32],
+    want_words: bool,
+) -> Option<(String, Vec<crate::types::Word>, f64)> {
+    let opts = RunOptions {
+        timestamps: if want_words {
+            TimestampKind::Word
+        } else {
+            TimestampKind::None
+        },
+        ..Default::default()
+    };
+    match session.run(pcm, &opts) {
         Ok(r) => {
             let t = r.text.trim().to_string();
             if t.is_empty() {
-                None
-            } else {
-                Some(t)
+                return None;
             }
+            let (words, confidence) = if want_words {
+                map_words(&r.words, &r.tokens)
+            } else {
+                (Vec::new(), 1.0)
+            };
+            Some((t, words, confidence))
         }
         Err(e) => {
             log::error!("[LocalSTT] transcription failed: {e}");
@@ -630,11 +664,65 @@ fn transcribe(session: &mut Session, pcm: &[f32]) -> Option<String> {
     }
 }
 
-fn send_final(event_tx: &mpsc::Sender<TranscriptEvent>, transcript: String) {
+/// Map a run's word + token rows into stt [`Word`](crate::types::Word) events and an
+/// overall utterance confidence. Per-word confidence is the mean of that word's tokens'
+/// `p`; the family emits `NaN` for `p` when it has no per-token probability, so those are
+/// skipped, and a word with no finite `p` reports `1.0` (unknown → don't penalize).
+/// Overall confidence is the mean of per-word confidences, or `1.0` when the model
+/// provides no probabilities at all — so downstream gating reads "no confidence signal"
+/// as "trust it", never as "reject".
+fn map_words(
+    words: &[transcribe_cpp::Word],
+    tokens: &[transcribe_cpp::Token],
+) -> (Vec<crate::types::Word>, f64) {
+    let mut out = Vec::with_capacity(words.len());
+    let mut conf_sum = 0.0f64;
+    let mut conf_n = 0usize;
+    for w in words {
+        let start = w.first_token.max(0) as usize;
+        let n = w.n_tokens.max(0) as usize;
+        let toks = tokens.get(start..start.saturating_add(n)).unwrap_or(&[]);
+        let (psum, pn) = toks.iter().fold((0.0f64, 0usize), |(s, c), t| {
+            if t.p.is_finite() {
+                (s + t.p as f64, c + 1)
+            } else {
+                (s, c)
+            }
+        });
+        let wconf = if pn > 0 {
+            let m = psum / pn as f64;
+            conf_sum += m;
+            conf_n += 1;
+            m
+        } else {
+            1.0
+        };
+        out.push(crate::types::Word {
+            text: w.text.clone(),
+            start: w.t0_ms as f64 / 1000.0,
+            end: w.t1_ms as f64 / 1000.0,
+            confidence: wconf,
+            punctuated_word: None,
+        });
+    }
+    let overall = if conf_n > 0 {
+        conf_sum / conf_n as f64
+    } else {
+        1.0
+    };
+    (out, overall)
+}
+
+fn send_final(
+    event_tx: &mpsc::Sender<TranscriptEvent>,
+    transcript: String,
+    words: Vec<crate::types::Word>,
+    confidence: f64,
+) {
     let _ = event_tx.blocking_send(TranscriptEvent::Final {
         transcript,
-        words: Vec::new(),
-        confidence: 1.0,
+        words,
+        confidence,
         speech_final: true,
     });
 }
@@ -669,4 +757,72 @@ fn rms(pcm: &[f32]) -> f32 {
         return 0.0;
     }
     (pcm.iter().map(|&s| s * s).sum::<f32>() / pcm.len() as f32).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tok(p: f32) -> transcribe_cpp::Token {
+        transcribe_cpp::Token {
+            p,
+            ..Default::default()
+        }
+    }
+
+    fn word(text: &str, t0: i64, t1: i64, first_token: i32, n_tokens: i32) -> transcribe_cpp::Word {
+        transcribe_cpp::Word {
+            t0_ms: t0,
+            t1_ms: t1,
+            first_token,
+            n_tokens,
+            text: text.to_string(),
+            seg_index: 0,
+        }
+    }
+
+    #[test]
+    fn map_words_maps_timing_and_averages_token_confidence() {
+        let tokens = vec![tok(0.9), tok(0.8), tok(0.6)];
+        let words = vec![word("hello", 0, 500, 0, 2), word("world", 500, 1000, 2, 1)];
+        let (mapped, overall) = map_words(&words, &tokens);
+
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0].text, "hello");
+        assert!((mapped[0].start - 0.0).abs() < 1e-9);
+        assert!((mapped[0].end - 0.5).abs() < 1e-9);
+        assert!((mapped[0].confidence - 0.85).abs() < 1e-6); // mean(0.9, 0.8)
+        assert!((mapped[1].confidence - 0.6).abs() < 1e-6);
+        assert!((overall - (0.85 + 0.6) / 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn map_words_treats_missing_probability_as_unknown_not_zero() {
+        // The family emits NaN for `p` when it has no per-token confidence.
+        let tokens = vec![tok(f32::NAN), tok(f32::NAN)];
+        let words = vec![word("x", 0, 100, 0, 2)];
+        let (mapped, overall) = map_words(&words, &tokens);
+        assert_eq!(mapped[0].confidence, 1.0);
+        assert_eq!(overall, 1.0); // no finite p anywhere → trust, don't reject
+    }
+
+    #[test]
+    fn next_boundary_cuts_at_eou_before_punctuation() {
+        let s = "turn to john <EOU> three sixteen.";
+        let end = next_boundary(s, 0).unwrap();
+        assert_eq!(&s[..end], "turn to john <EOU>");
+        assert_eq!(strip_tags(&s[..end]).trim(), "turn to john");
+    }
+
+    #[test]
+    fn next_boundary_cuts_at_punctuation_when_no_tag() {
+        let s = "hello world. and more";
+        let end = next_boundary(s, 0).unwrap();
+        assert_eq!(&s[..end], "hello world.");
+    }
+
+    #[test]
+    fn next_boundary_none_when_no_boundary() {
+        assert!(next_boundary("no boundary yet", 0).is_none());
+    }
 }
