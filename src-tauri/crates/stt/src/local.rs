@@ -128,9 +128,10 @@ impl SttEngine for LocalSttClient {
     ) -> Result<(), SttError> {
         let streaming = std::env::var("RHEMA_STT_STREAM").as_deref() == Ok("1");
         // When RHEMA_STT_MODEL is unset, fall back to the config we settled on for this
-        // hardware: streaming → nemotron Q5 (accurate + keeps pace at att_right=13),
-        // offline → parakeet Q8 (accurate, ~30x-realtime decode). Lets the app run with
-        // just RHEMA_STT_PROVIDER=local [RHEMA_STT_STREAM=1] and no model path.
+        // hardware: streaming → nemotron Q8 (best on-device accuracy; still keeps real-time
+        // pace at att_right=13 on an i5-8265U), offline → parakeet Q8 (accurate,
+        // ~30x-realtime decode). Lets the app run with just RHEMA_STT_PROVIDER=local
+        // [RHEMA_STT_STREAM=1] and no model path. Override any time with RHEMA_STT_MODEL.
         let model_path = {
             let p = self.model_path.clone();
             if p.trim().is_empty() {
@@ -174,7 +175,7 @@ fn resolve_threads() -> i32 {
 /// setting `RHEMA_STT_MODEL` to an absolute path.
 fn default_model_path(streaming: bool) -> String {
     let file = if streaming {
-        "nemotron-3.5-asr-streaming-0.6b-Q5_K_M.gguf"
+        "nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf"
     } else {
         "parakeet-unified-en-0.6b-Q8_0.gguf"
     };
