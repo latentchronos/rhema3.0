@@ -194,11 +194,13 @@ export function TranscriptPanel() {
   }
 
   const exportTranscript = () => {
-    const segs = useTranscriptStore.getState().segments
-    if (segs.length === 0) return
+    // Export the FULL service (fullLog), not the windowed on-screen `segments` — the
+    // rendered list is capped for performance but the log retains everything.
+    const log = useTranscriptStore.getState().fullLog
+    if (log.length === 0) return
     const stamp = new Date()
     const header = `Rhema transcript — exported ${stamp.toLocaleString()}\n${"=".repeat(48)}\n\n`
-    const body = segs.map((s) => s.text).join("\n")
+    const body = log.join("\n")
     const blob = new Blob([header + body + "\n"], {
       type: "text/plain;charset=utf-8",
     })
