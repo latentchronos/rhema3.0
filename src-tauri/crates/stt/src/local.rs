@@ -103,6 +103,11 @@ const PREROLL_RECOVER: usize = SR;
 /// audio is the ASR confidence attached to a Final. Recent-window (not whole-transcript) so
 /// a genuinely bad patch of audio actually pulls the value down toward the projection gate.
 const CONF_WINDOW_MS: i64 = 3000;
+/// How often the streaming confidence is recomputed from a fresh (O(total tokens)) snapshot.
+/// Confidence is a slow-moving signal, so caching it and refreshing at most this often keeps
+/// the snapshot cadence bounded (like the backlog meter) instead of firing per finalized
+/// phrase — which otherwise recurs every few seconds AND grows with session length.
+const CONF_REFRESH: Duration = Duration::from_secs(2);
 
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
@@ -400,6 +405,7 @@ fn run_stream_loop(
     // empty committed text). `preroll` retains the most recent audio so a recovered stream
     // can warm its encoder cache.
     let mut committer = StreamCommitter::new();
+    let mut conf_cache = ConfidenceCache::new();
     let mut meter = BacklogMeter::new();
     let mut preroll: VecDeque<f32> = VecDeque::with_capacity(PREROLL_RECOVER);
     let mut restart_attempts: u32 = 0;
@@ -504,6 +510,7 @@ fn run_stream_loop(
                         emit_stream_text(
                             &event_tx,
                             &mut committer,
+                            &mut conf_cache,
                             &stream,
                             &txt.committed,
                             &txt.tentative,
@@ -538,7 +545,7 @@ fn run_stream_loop(
             // Clean stop: flush and emit the tail as a Final, then exit the lifecycle.
             if stream.finalize().is_ok() {
                 let txt = stream.text();
-                emit_stream_text(&event_tx, &mut committer, &stream, &txt.committed, &txt.tentative, true);
+                emit_stream_text(&event_tx, &mut committer, &mut conf_cache, &stream, &txt.committed, &txt.tentative, true);
             }
             break 'session;
         }
@@ -583,18 +590,20 @@ fn run_stream_loop(
 fn emit_stream_text(
     event_tx: &mpsc::Sender<TranscriptEvent>,
     committer: &mut StreamCommitter,
+    conf: &mut ConfidenceCache,
     stream: &Stream,
     committed: &str,
     tentative: &str,
     flush: bool,
 ) {
     let segments = committer.advance(committed, tentative, flush);
-    // Compute confidence once, and only when there's a Final to attach it to.
+    // Compute confidence once, and only when there's a Final to attach it to. The cache
+    // rate-limits the underlying snapshot so this stays cheap regardless of phrase cadence.
     let confidence = if segments
         .iter()
         .any(|s| matches!(s, TranscriptSegment::Final(_)))
     {
-        committed_window_confidence(stream)
+        conf.get(stream)
     } else {
         1.0
     };
@@ -606,11 +615,36 @@ fn emit_stream_text(
     }
 }
 
-/// Recent-window ASR confidence: mean per-token `p` over the last [`CONF_WINDOW_MS`] of
-/// committed audio. Snapshots the stream (materializes all tokens) and delegates the pure
-/// windowing to [`window_mean_p`].
-fn committed_window_confidence(stream: &Stream) -> f64 {
-    window_mean_p(&stream.snapshot().tokens)
+/// Rate-limited streaming ASR confidence. Computing it means `stream.snapshot()`, which
+/// materializes the whole token list (O(total tokens)) — cheap early, but it grows with
+/// session length and would recur on every finalized phrase. Since confidence is a
+/// slow-moving signal, cache the value and refresh from a fresh snapshot at most every
+/// [`CONF_REFRESH`], reusing it for finals in between.
+struct ConfidenceCache {
+    value: f64,
+    last: Instant,
+}
+
+impl ConfidenceCache {
+    fn new() -> Self {
+        // Start stale so the first Final triggers a real compute.
+        Self {
+            value: 1.0,
+            last: Instant::now()
+                .checked_sub(CONF_REFRESH)
+                .unwrap_or_else(Instant::now),
+        }
+    }
+
+    /// The current confidence, refreshing from a stream snapshot only when the cache is
+    /// stale — so the O(total tokens) snapshot runs at most once per [`CONF_REFRESH`].
+    fn get(&mut self, stream: &Stream) -> f64 {
+        if self.last.elapsed() >= CONF_REFRESH {
+            self.value = window_mean_p(&stream.snapshot().tokens);
+            self.last = Instant::now();
+        }
+        self.value
+    }
 }
 
 /// Mean per-token `p` over the last [`CONF_WINDOW_MS`] (by `t1_ms`). `1.0` when the model
