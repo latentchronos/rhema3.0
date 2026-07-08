@@ -6,9 +6,26 @@ export interface DetectionResult {
   chapter: number
   verse: number
   confidence: number
-  source: "direct" | "semantic_local" | "semantic_cloud"
+  source:
+    | "direct"
+    | "contextual"
+    | "quotation"
+    | "semantic_local"
+    | "semantic_cloud"
   auto_queued: boolean
+  raw_score: number
+  minimum_threshold: number
+  auto_queue_threshold: number
+  decision: "auto_queued" | "review_required"
+  explanation: string
   transcript_snippet: string
+  /**
+   * Whether this detection came from an authoritative (committed/final) transcript
+   * rather than an unstable interim/partial. Only final detections may drive projection
+   * (preview selection + auto-queue); partial detections still appear in the panel as
+   * preview/priming but must never move the screen. Backend guarantees this field.
+   */
+  is_final: boolean
 }
 
 export interface DetectionStatus {

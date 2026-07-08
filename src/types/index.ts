@@ -7,7 +7,23 @@ export type {
 export type { Translation, Book, Verse, CrossReference } from "./bible"
 export type { QueueItem } from "./queue"
 export type { DetectionResult, DetectionStatus } from "./detection"
-export type { BroadcastTheme, VerseRenderData, VerseSegment, RenderOptions } from "./broadcast"
+export type {
+  BroadcastTheme,
+  VerseRenderData,
+  VerseSegment,
+  RenderOptions,
+  ObsOverlayStatus,
+  RoutingMode,
+  ChannelVerse,
+  AudienceChannelState,
+  PastorChannelState,
+  ChannelQueueItem,
+  ChannelDetection,
+  ChannelSuggestion,
+  OperatorChannelState,
+  DeviceConnection,
+  DeviceStatus,
+} from "./broadcast"
 export type {
   NdiAlphaMode,
   NdiConfigEventPayload,

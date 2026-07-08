@@ -1,6 +1,11 @@
+mod channels;
 mod commands;
+mod epoch;
 mod events;
+mod nav_lookup;
 mod state;
+mod suggestion;
+mod suppression;
 
 use std::sync::Mutex;
 
@@ -18,10 +23,15 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(Mutex::new(state::AppState::new()))
+        .manage(epoch::EpochLock::default())
         .manage(Mutex::new(rhema_broadcast::ndi::NdiRuntime::default()))
         .manage(Mutex::new(rhema_detection::DirectDetector::new()))
         .manage(Mutex::new(rhema_detection::DetectionMerger::new()))
         .manage(Mutex::new(rhema_detection::ReadingMode::new()))
+        .manage(Mutex::new(commands::obs::ObsOverlayServer::default()))
+        .manage(Mutex::new(channels::ChannelState::default()))
+        .manage(Mutex::new(suggestion::SuggestionEngine::new()))
+        .manage(Mutex::new(Option::<rhema_api::llm::LlmConfig>::None))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -33,12 +43,24 @@ pub fn run() {
             commands::bible::get_active_translation,
             commands::bible::set_active_translation,
             commands::detection::detect_verses,
+            commands::detection::acquire_operator_lock,
             commands::detection::detection_status,
             commands::detection::semantic_search,
             commands::detection::toggle_paraphrase_detection,
             commands::detection::quotation_search,
             commands::detection::reading_mode_status,
             commands::detection::stop_reading_mode,
+            commands::detection::set_sermon_notes,
+            commands::detection::dismiss_suggestion,
+            commands::detection::set_cursor_position,
+            commands::detection::next_verse,
+            commands::detection::previous_verse,
+            commands::detection::go_to_reference,
+            commands::detection::step_verses,
+            commands::detection::undo_navigation,
+            commands::detection::start_session,
+            commands::detection::end_session,
+            commands::detection::session_status,
             commands::audio::get_audio_devices,
             commands::stt::start_transcription,
             commands::stt::stop_transcription,
@@ -50,9 +72,41 @@ pub fn run() {
             commands::broadcast::stop_ndi,
             commands::broadcast::get_ndi_status,
             commands::broadcast::push_ndi_frame,
+            commands::obs::start_obs_overlay,
+            commands::obs::stop_obs_overlay,
+            commands::obs::get_obs_overlay_status,
+            commands::obs::push_obs_overlay,
+            channels::set_routing_mode,
+            channels::commit_live_verse,
+            commands::llm::set_llm_config,
+            commands::llm::llm_status,
+            commands::llm::clear_llm_config,
         ])
         .setup(|app| {
             use tauri::Manager;
+
+            // Drain the Stage-2 (LLM fallback) channel (Bullet L5). The detection
+            // pipeline queues ambiguous transcripts; the worker classifies each
+            // via the configured multi-provider LLM and routes scripture hits
+            // back through direct detection. No-op until a provider is configured.
+            {
+                let stage2_rx = app
+                    .state::<Mutex<state::AppState>>()
+                    .lock()
+                    .unwrap()
+                    .detection_pipeline
+                    .take_stage2_receiver();
+                if let Some(rx) = stage2_rx {
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(commands::stt::run_stage2_worker(handle, rx));
+                }
+            }
+
+            // Phase 4 (Bullet 4.4): start the 2s device-health monitor. It
+            // probes each output endpoint, updates the operator channel's
+            // device_health on change, and resyncs the audience channel on
+            // reconnect. Channel content state is never reset by a device drop.
+            channels::spawn_device_health_monitor(app.handle().clone());
 
             // Try resource dir first (production), then dev fallback
             let db_path = app

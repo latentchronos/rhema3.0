@@ -1,9 +1,26 @@
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::types::VerseRef;
 
 /// How long context remains valid (3 minutes, matching Logos AI).
 const CONTEXT_TIMEOUT_SECS: u64 = 180;
+
+/// Active-window span for the topic vector (Bullet 5.1). A sentence exactly this
+/// old sits on the 0.75/0.25 block boundary — chosen so the two-block weighting
+/// approximates an exponential decay with a 90s half-life (a 90s-old sentence
+/// carries ~half the weight of a current one).
+const ACTIVE_WINDOW_SECS: u64 = 90;
+
+/// Weight on the active (last-90s) block of the topic vector.
+const ACTIVE_WEIGHT: f32 = 0.75;
+
+/// Weight on the background (older-than-90s) block of the topic vector.
+const BACKGROUND_WEIGHT: f32 = 0.25;
+
+/// Maximum number of embeddings retained in the background block. When exceeded,
+/// the oldest are dropped — the topic vector degrades gracefully (§9.3).
+const BACKGROUND_WINDOW_CAP: usize = 500;
 
 /// Confidence boost for detections in the same book as the current context.
 pub const SAME_BOOK_BOOST: f64 = 0.05;
@@ -34,6 +51,14 @@ pub struct SermonContext {
     last_update: Option<Instant>,
     /// History of all detected verses this session.
     session_history: Vec<SessionEntry>,
+    /// Sentence embeddings from the last [`ACTIVE_WINDOW_SECS`] (Bullet 5.1).
+    active_window: VecDeque<(Vec<f32>, Instant)>,
+    /// Sentence embeddings older than the active window (capped FIFO).
+    background_window: VecDeque<(Vec<f32>, Instant)>,
+    /// Lazily computed topic vector, recomputed when `topic_dirty` is set.
+    topic_vector: Option<Vec<f32>>,
+    /// True when the windows have changed since the topic vector was computed.
+    topic_dirty: bool,
 }
 
 impl SermonContext {
@@ -43,6 +68,10 @@ impl SermonContext {
             current_chapter: None,
             last_update: None,
             session_history: Vec::new(),
+            active_window: VecDeque::new(),
+            background_window: VecDeque::new(),
+            topic_vector: None,
+            topic_dirty: false,
         }
     }
 
@@ -118,6 +147,77 @@ impl SermonContext {
         0.0
     }
 
+    /// Ingest one sentence embedding into the topic-vector windows (Bullet 5.1).
+    /// Embeddings are supplied pre-computed (by the app consumer via the semantic
+    /// model) — `SermonContext` stays model-free.
+    pub fn ingest_embedding(&mut self, embedding: Vec<f32>) {
+        self.ingest_embedding_at(embedding, Instant::now());
+    }
+
+    /// Time-injected core of [`ingest_embedding`] for deterministic tests.
+    pub fn ingest_embedding_at(&mut self, embedding: Vec<f32>, now: Instant) {
+        self.active_window.push_back((embedding, now));
+
+        // Drain active entries older than the 90s window into the background block.
+        if let Some(cutoff) = now.checked_sub(Duration::from_secs(ACTIVE_WINDOW_SECS)) {
+            while let Some((_, ts)) = self.active_window.front() {
+                if *ts < cutoff {
+                    if let Some(entry) = self.active_window.pop_front() {
+                        self.background_window.push_back(entry);
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Cap the background block, dropping the oldest entries.
+        while self.background_window.len() > BACKGROUND_WINDOW_CAP {
+            self.background_window.pop_front();
+        }
+
+        self.topic_dirty = true;
+    }
+
+    /// The current topic vector (lazy 75/25 two-block compute, Bullet 5.1).
+    /// `None` when no sentences have been ingested. Cached until the windows change.
+    pub fn topic_vector(&mut self) -> Option<Vec<f32>> {
+        if !self.topic_dirty {
+            if let Some(v) = &self.topic_vector {
+                return Some(v.clone());
+            }
+        }
+        let computed = self.compute_topic_vector();
+        self.topic_vector = computed.clone();
+        self.topic_dirty = false;
+        computed
+    }
+
+    fn compute_topic_vector(&self) -> Option<Vec<f32>> {
+        let active_mean = mean_embedding(self.active_window.iter().map(|(e, _)| e))?;
+        let bg_mean = match mean_embedding(self.background_window.iter().map(|(e, _)| e)) {
+            Some(m) if m.len() == active_mean.len() => m,
+            // Empty or dimension-mismatched background → active block only.
+            _ => return Some(active_mean),
+        };
+        let topic = active_mean
+            .iter()
+            .zip(bg_mean.iter())
+            .map(|(a, b)| ACTIVE_WEIGHT * a + BACKGROUND_WEIGHT * b)
+            .collect();
+        Some(topic)
+    }
+
+    /// Number of embeddings in the active block (test/inspection helper).
+    pub fn active_window_len(&self) -> usize {
+        self.active_window.len()
+    }
+
+    /// Number of embeddings in the background block (test/inspection helper).
+    pub fn background_window_len(&self) -> usize {
+        self.background_window.len()
+    }
+
     /// Get the full session history.
     pub fn history(&self) -> &[SessionEntry] {
         &self.session_history
@@ -129,6 +229,10 @@ impl SermonContext {
         self.current_book = None;
         self.current_chapter = None;
         self.last_update = None;
+        self.active_window.clear();
+        self.background_window.clear();
+        self.topic_vector = None;
+        self.topic_dirty = false;
     }
 
     /// Find the most recent detection for a given book (for "back in Genesis" pattern).
@@ -145,6 +249,33 @@ impl Default for SermonContext {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Element-wise mean of a set of equal-length embeddings. Returns `None` for an
+/// empty set; embeddings whose length differs from the first are skipped.
+fn mean_embedding<'a, I: Iterator<Item = &'a Vec<f32>>>(embeddings: I) -> Option<Vec<f32>> {
+    let mut sum: Vec<f32> = Vec::new();
+    let mut count = 0usize;
+    for e in embeddings {
+        if sum.is_empty() {
+            sum = vec![0.0; e.len()];
+        }
+        if e.len() != sum.len() {
+            continue;
+        }
+        for (s, v) in sum.iter_mut().zip(e.iter()) {
+            *s += v;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    let inv = 1.0 / count as f32;
+    for s in sum.iter_mut() {
+        *s *= inv;
+    }
+    Some(sum)
 }
 
 #[cfg(test)]
@@ -228,5 +359,81 @@ mod tests {
         let last_romans = ctx.last_in_book(45).unwrap();
         assert_eq!(last_romans.chapter, 9);
         assert_eq!(last_romans.verse_start, 1);
+    }
+
+    // --- Bullet 5.1: time-decay topic vector ---
+
+    fn approx(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-5, "expected {b:?}, got {a:?}");
+        }
+    }
+
+    #[test]
+    fn test_empty_topic_vector_is_none() {
+        let mut ctx = SermonContext::new();
+        assert!(ctx.topic_vector().is_none());
+    }
+
+    #[test]
+    fn test_topic_vector_active_only_is_mean() {
+        let mut ctx = SermonContext::new();
+        let base = Instant::now();
+        ctx.ingest_embedding_at(vec![1.0, 0.0], base);
+        ctx.ingest_embedding_at(vec![0.0, 1.0], base + Duration::from_secs(1));
+        // Both within the 90s active window, background empty → plain mean.
+        approx(&ctx.topic_vector().unwrap(), &[0.5, 0.5]);
+        assert_eq!(ctx.active_window_len(), 2);
+        assert_eq!(ctx.background_window_len(), 0);
+    }
+
+    #[test]
+    fn test_time_decay_window_shift() {
+        let mut ctx = SermonContext::new();
+        let base = Instant::now();
+        // "grace" at t0
+        ctx.ingest_embedding_at(vec![1.0, 0.0], base);
+        // "judgment" 100s later → grace (age 100s > 90s) drains to background
+        ctx.ingest_embedding_at(vec![0.0, 1.0], base + Duration::from_secs(100));
+
+        assert_eq!(ctx.active_window_len(), 1);
+        assert_eq!(ctx.background_window_len(), 1);
+        // 0.75*[0,1] + 0.25*[1,0] = [0.25, 0.75] → shifted toward judgment
+        approx(&ctx.topic_vector().unwrap(), &[0.25, 0.75]);
+    }
+
+    #[test]
+    fn test_background_window_capped_at_500() {
+        let mut ctx = SermonContext::new();
+        let base = Instant::now();
+        // Each ingest is 100s after the previous, so every prior active entry
+        // drains to background. After 600 ingests the cap holds at 500.
+        for i in 0..600u64 {
+            ctx.ingest_embedding_at(vec![1.0], base + Duration::from_secs(i * 100));
+        }
+        assert_eq!(ctx.background_window_len(), BACKGROUND_WINDOW_CAP);
+        assert_eq!(ctx.active_window_len(), 1);
+    }
+
+    #[test]
+    fn test_topic_vector_lazy_recompute_on_ingest() {
+        let mut ctx = SermonContext::new();
+        let base = Instant::now();
+        ctx.ingest_embedding_at(vec![1.0, 0.0], base);
+        approx(&ctx.topic_vector().unwrap(), &[1.0, 0.0]);
+        // New sentence marks dirty → next call reflects it.
+        ctx.ingest_embedding_at(vec![0.0, 1.0], base + Duration::from_secs(1));
+        approx(&ctx.topic_vector().unwrap(), &[0.5, 0.5]);
+    }
+
+    #[test]
+    fn test_clear_session_resets_topic_state() {
+        let mut ctx = SermonContext::new();
+        ctx.ingest_embedding_at(vec![1.0, 0.0], Instant::now());
+        ctx.clear_session();
+        assert_eq!(ctx.active_window_len(), 0);
+        assert_eq!(ctx.background_window_len(), 0);
+        assert!(ctx.topic_vector().is_none());
     }
 }

@@ -1,6 +1,15 @@
 import { create } from "zustand"
 import { emitTo } from "@tauri-apps/api/event"
-import type { BroadcastTheme, VerseRenderData } from "@/types"
+import { invoke } from "@tauri-apps/api/core"
+import type {
+  AudienceChannelState,
+  BroadcastTheme,
+  DeviceStatus,
+  OperatorChannelState,
+  PastorChannelState,
+  RoutingMode,
+  VerseRenderData,
+} from "@/types"
 import { BUILTIN_THEMES } from "@/lib/builtin-themes"
 
 type SelectedElement = "verse" | "reference" | null
@@ -11,6 +20,15 @@ interface BroadcastState {
   altActiveThemeId: string
   isLive: boolean
   liveVerse: VerseRenderData | null
+
+  // --- Phase 4 channel model (ADDITIVE — caches of backend channel truth).
+  // The channel fields below are populated ONLY by Tauri event listeners
+  // (see hooks/use-channels.ts); never mutate them directly from components.
+  routingMode: RoutingMode
+  audienceChannel: AudienceChannelState | null
+  pastorChannel: PastorChannelState | null
+  operatorChannel: OperatorChannelState | null
+  deviceHealth: DeviceStatus[]
 
   // Designer state
   isDesignerOpen: boolean
@@ -30,6 +48,12 @@ interface BroadcastState {
   syncBroadcastOutput: () => void
   syncBroadcastOutputFor: (outputId: string) => void
 
+  // Phase 4 channel actions
+  setRoutingMode: (mode: RoutingMode) => void
+  setAudienceChannel: (channel: AudienceChannelState) => void
+  setPastorChannel: (channel: PastorChannelState) => void
+  setOperatorChannel: (channel: OperatorChannelState) => void
+
   // Designer actions
   setDesignerOpen: (open: boolean) => void
   startEditing: (themeId: string) => void
@@ -40,17 +64,25 @@ interface BroadcastState {
   setSelectedElement: (el: SelectedElement) => void
 }
 
-function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): Record<string, unknown> {
+function setNestedValue(
+  obj: Record<string, unknown>,
+  path: string,
+  value: unknown
+): Record<string, unknown> {
   const keys = path.split(".")
   const isIndex = (key: string) => /^\d+$/.test(key)
-  const result: Record<string, unknown> = Array.isArray(obj) ? [...obj] as unknown as Record<string, unknown> : { ...obj }
+  const result: Record<string, unknown> = Array.isArray(obj)
+    ? ([...obj] as unknown as Record<string, unknown>)
+    : { ...obj }
 
   let current: Record<string, unknown> | unknown[] = result
   for (let i = 0; i < keys.length - 1; i++) {
     const key = keys[i]
     const nextKey = keys[i + 1]
     const currentIndex = isIndex(key) ? Number(key) : key
-    const existing = (current as Record<string, unknown> | unknown[])[currentIndex as keyof typeof current]
+    const existing = (current as Record<string, unknown> | unknown[])[
+      currentIndex as keyof typeof current
+    ]
     const nextContainer = Array.isArray(existing)
       ? [...existing]
       : existing && typeof existing === "object"
@@ -59,13 +91,17 @@ function setNestedValue(obj: Record<string, unknown>, path: string, value: unkno
           ? []
           : {}
 
-    ;(current as Record<string, unknown> | unknown[])[currentIndex as keyof typeof current] = nextContainer as never
+    ;(current as Record<string, unknown> | unknown[])[
+      currentIndex as keyof typeof current
+    ] = nextContainer as never
     current = nextContainer as Record<string, unknown> | unknown[]
   }
 
   const lastKey = keys[keys.length - 1]
   const lastIndex = isIndex(lastKey) ? Number(lastKey) : lastKey
-  ;(current as Record<string, unknown> | unknown[])[lastIndex as keyof typeof current] = value as never
+  ;(current as Record<string, unknown> | unknown[])[
+    lastIndex as keyof typeof current
+  ] = value as never
 
   return result
 }
@@ -76,6 +112,11 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
   altActiveThemeId: BUILTIN_THEMES[0].id,
   isLive: false,
   liveVerse: null,
+  routingMode: "locked",
+  audienceChannel: null,
+  pastorChannel: null,
+  operatorChannel: null,
+  deviceHealth: [],
   isDesignerOpen: false,
   editingThemeId: null,
   draftTheme: null,
@@ -118,6 +159,13 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
       theme,
       verse: s.liveVerse,
     }).catch(() => {})
+    void invoke("push_obs_overlay", {
+      payload: {
+        outputId,
+        theme,
+        verse: s.liveVerse,
+      },
+    }).catch(() => {})
   },
   syncBroadcastOutput: () => {
     get().syncBroadcastOutputFor("main")
@@ -137,10 +185,33 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
     get().syncBroadcastOutput()
   },
 
+  // Phase 4 — operator selects the routing mode. Optimistically set locally and
+  // tell the backend, which re-publishes the pastor/operator channels.
+  setRoutingMode: (routingMode) => {
+    set({ routingMode })
+    void invoke("set_routing_mode", { mode: routingMode }).catch(() => {})
+  },
+  // Phase 4 — channel caches. Called ONLY by the Tauri event listeners.
+  setAudienceChannel: (audienceChannel) => set({ audienceChannel }),
+  setPastorChannel: (pastorChannel) => set({ pastorChannel }),
+  setOperatorChannel: (operatorChannel) =>
+    set({
+      operatorChannel,
+      // Mirror the authoritative routing mode the backend reports.
+      routingMode: operatorChannel.routing_state,
+      // Device health is delivered inside the operator channel (Bullet 4.4).
+      deviceHealth: operatorChannel.device_health,
+    }),
+
   // Designer
   setDesignerOpen: (isDesignerOpen) => {
     if (!isDesignerOpen) {
-      set({ isDesignerOpen, editingThemeId: null, draftTheme: null, selectedElement: null })
+      set({
+        isDesignerOpen,
+        editingThemeId: null,
+        draftTheme: null,
+        selectedElement: null,
+      })
     } else {
       set({ isDesignerOpen })
     }
@@ -156,12 +227,18 @@ export const useBroadcastStore = create<BroadcastState>((set, get) => ({
   },
   updateDraft: (updates) =>
     set((s) => ({
-      draftTheme: s.draftTheme ? { ...s.draftTheme, ...updates, updatedAt: Date.now() } : null,
+      draftTheme: s.draftTheme
+        ? { ...s.draftTheme, ...updates, updatedAt: Date.now() }
+        : null,
     })),
   updateDraftNested: (path, value) =>
     set((s) => ({
       draftTheme: s.draftTheme
-        ? (setNestedValue(s.draftTheme as unknown as Record<string, unknown>, path, value) as unknown as BroadcastTheme)
+        ? (setNestedValue(
+            s.draftTheme as unknown as Record<string, unknown>,
+            path,
+            value
+          ) as unknown as BroadcastTheme)
         : null,
     })),
   saveDraft: () => {

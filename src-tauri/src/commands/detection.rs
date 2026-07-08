@@ -1,8 +1,13 @@
 use std::sync::Mutex;
 use tauri::State;
 
+use crate::epoch::EpochLock;
 use crate::state::AppState;
-use rhema_detection::{MergedDetection, ReadingMode};
+use rhema_bible::BibleDb;
+use rhema_detection::{
+    CursorMode, CursorState, MergedDetection, NavDirection, NavOutcome, NavUnit, PrimingIndex,
+    ReadingMode, VersePosition,
+};
 use serde::Serialize;
 
 /// Serializable detection result for the frontend
@@ -17,7 +22,402 @@ pub struct DetectionResult {
     pub confidence: f64,
     pub source: String,
     pub auto_queued: bool,
+    pub raw_score: f64,
+    pub minimum_threshold: f64,
+    pub auto_queue_threshold: f64,
+    pub decision: String,
+    pub explanation: String,
     pub transcript_snippet: String,
+    /// Whether this detection came from an authoritative (committed/final) transcript
+    /// rather than an unstable interim/partial. Only final detections may drive
+    /// projection (preview selection + auto-queue) on the frontend; partial detections
+    /// still populate the detections panel and operator console as preview/priming, but
+    /// never move the screen. See RHEMA_V2_ARCHITECTURE §4 (committed-only projection).
+    pub is_final: bool,
+}
+
+/// Start the service session (§2.4). Detections, voice commands, and proactive
+/// suggestions are ignored until this is called — so pre-service audio (sound
+/// check, announcements) can't fire false detections. Resets session-scoped
+/// state for a clean service.
+#[tauri::command]
+pub fn start_session(
+    state: State<'_, Mutex<AppState>>,
+    suggestion: State<'_, Mutex<crate::suggestion::SuggestionEngine>>,
+) -> Result<(), String> {
+    {
+        let mut s = state.lock().map_err(|e| e.to_string())?;
+        s.session_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        s.sermon_context.clear_session();
+        s.cursor = None;
+    }
+    if let Ok(mut eng) = suggestion.lock() {
+        eng.clear_session();
+    }
+    log::info!("session: started");
+    Ok(())
+}
+
+/// End the service session. Detections/commands are ignored until restarted.
+#[tauri::command]
+pub fn end_session(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    s.session_active
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    log::info!("session: ended");
+    Ok(())
+}
+
+/// Whether the service session is currently active.
+#[tauri::command]
+pub fn session_status(state: State<'_, Mutex<AppState>>) -> Result<bool, String> {
+    let s = state.lock().map_err(|e| e.to_string())?;
+    Ok(s.session_active
+        .load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// A verse resolved by a navigation command, for the frontend to project.
+#[derive(Clone, Serialize)]
+pub struct NavVerse {
+    pub book_number: i32,
+    pub book_name: String,
+    pub chapter: i32,
+    pub verse: i32,
+    pub text: String,
+    pub reference: String,
+}
+
+/// Seed / update the formal navigation cursor (Phase 3 app-side follow-up).
+/// Called by the frontend whenever a verse goes live, so next/previous-verse
+/// navigate from the current live position. No-op when already on that verse
+/// (so re-committing after a nav step doesn't reset history) or when the verse
+/// has no resolvable book number (book_number < 1, e.g. a name-only suggestion).
+#[tauri::command]
+pub fn set_cursor_position(
+    book_number: i32,
+    chapter: i32,
+    verse: i32,
+    translation: String,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<(), String> {
+    if !(1..=66).contains(&book_number) {
+        return Ok(());
+    }
+    let book = book_number as u8;
+    let chapter = chapter.max(1) as u16;
+    let verse = verse.max(1) as u16;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    if let Some(cursor) = &app_state.cursor {
+        let p = cursor.position();
+        if p.book == book && p.chapter == chapter && p.verse == verse && p.translation == translation
+        {
+            return Ok(());
+        }
+    }
+    let position = match VersePosition::new(book, chapter, verse, translation, None) {
+        Ok(p) => p,
+        Err(_) => return Ok(()),
+    };
+    match &mut app_state.cursor {
+        Some(cursor) => cursor.navigate_to(position, CursorMode::Single),
+        None => app_state.cursor = Some(CursorState::new(position, CursorMode::Single)),
+    }
+    Ok(())
+}
+
+/// Advance the cursor to the next verse (Phase 3.4/3.5 bounds via BibleDb).
+/// Returns the resolved verse for the frontend to project, or `None` on a Bible
+/// boundary / cold cursor / lookup failure.
+#[tauri::command]
+pub fn next_verse(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<Option<NavVerse>, String> {
+    navigate(state, reading, true)
+}
+
+/// Step the cursor to the previous verse. See [`next_verse`].
+#[tauri::command]
+pub fn previous_verse(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<Option<NavVerse>, String> {
+    navigate(state, reading, false)
+}
+
+/// Deactivate reading mode if active — manual navigation exits it (§6.8).
+fn exit_reading_mode(reading: &Mutex<ReadingMode>) {
+    if let Ok(mut rm) = reading.lock() {
+        if rm.is_active() {
+            rm.deactivate();
+        }
+    }
+}
+
+fn navigate(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+    forward: bool,
+) -> Result<Option<NavVerse>, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(None);
+    };
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = if forward {
+        cursor.next_verse(&lookup)
+    } else {
+        cursor.previous_verse(&lookup)
+    };
+    if !matches!(outcome, NavOutcome::Moved) {
+        return Ok(None);
+    }
+
+    let p = cursor.position().clone();
+    let tid = db
+        .list_translations()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|t| t.abbreviation.eq_ignore_ascii_case(&p.translation))
+        .map(|t| t.id);
+    let Some(tid) = tid else {
+        return Ok(None);
+    };
+    let resolved = db
+        .get_verse(tid, p.book as i32, p.chapter as i32, p.verse as i32)
+        .map_err(|e| e.to_string())?;
+    Ok(resolved.map(|v| NavVerse {
+        book_number: v.book_number,
+        book_name: v.book_name.clone(),
+        chapter: v.chapter,
+        verse: v.verse,
+        text: v.text,
+        reference: format!("{} {}:{}", v.book_name, v.chapter, v.verse),
+    }))
+}
+
+/// Resolve a translation abbreviation (e.g. "KJV") to its DB id.
+fn resolve_tid(db: &BibleDb, translation: &str) -> Option<i64> {
+    db.list_translations()
+        .ok()?
+        .into_iter()
+        .find(|t| t.abbreviation.eq_ignore_ascii_case(translation))
+        .map(|t| t.id)
+}
+
+/// Build a `NavVerse` for the verse at `p`, or `None` if it can't be resolved.
+fn nav_verse_at(db: &BibleDb, tid: i64, p: &VersePosition) -> Option<NavVerse> {
+    let v = db
+        .get_verse(tid, p.book as i32, p.chapter as i32, p.verse as i32)
+        .ok()??;
+    Some(NavVerse {
+        book_number: v.book_number,
+        book_name: v.book_name.clone(),
+        chapter: v.chapter,
+        verse: v.verse,
+        text: v.text,
+        reference: format!("{} {}:{}", v.book_name, v.chapter, v.verse),
+    })
+}
+
+/// Outcome of a structured navigation command (Bullet V4), serialized for the UI
+/// as `{ "status": "moved" | "no_change" | "chapter_out_of_range" | "verse_out_of_range", ... }`.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum NavCommandResult {
+    /// The cursor moved — project this verse.
+    Moved { verse: NavVerse },
+    /// Nothing happened (Bible boundary, cold cursor, or unresolved lookup).
+    NoChange,
+    /// The requested chapter does not exist in the current book/translation.
+    ChapterOutOfRange {
+        book_name: String,
+        requested: u16,
+        last_chapter: u16,
+    },
+    /// The requested verse does not exist in the current chapter/translation
+    /// (past the end, or omitted in this version).
+    VerseOutOfRange {
+        book_name: String,
+        chapter: u16,
+        requested: u16,
+        last_verse: u16,
+    },
+}
+
+/// Absolute navigation (Bullet V4): jump within the current book. `chapter`/
+/// `verse` are optional — `None` chapter stays in the current chapter, `None`
+/// verse lands on verse 1. Validated against the active translation; returns the
+/// resolved verse, or an out-of-range result the UI surfaces as a toast.
+#[tauri::command]
+pub fn go_to_reference(
+    chapter: Option<u16>,
+    verse: Option<u16>,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    // Manual navigation exits reading mode (ARCHITECTURE §6.8).
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let before = cursor.position().clone();
+    let Some(tid) = resolve_tid(db, &before.translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+    let req_chapter = chapter.unwrap_or(before.chapter);
+    let req_verse = verse.unwrap_or(1);
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = cursor.jump_to(&lookup, chapter, verse);
+
+    let book_name = || nav_verse_at(db, tid, &before).map(|v| v.book_name).unwrap_or_default();
+    Ok(match outcome {
+        NavOutcome::Moved => match nav_verse_at(db, tid, cursor.position()) {
+            Some(verse) => NavCommandResult::Moved { verse },
+            None => NavCommandResult::NoChange,
+        },
+        NavOutcome::ChapterOutOfRange { last_chapter } => NavCommandResult::ChapterOutOfRange {
+            book_name: book_name(),
+            requested: req_chapter,
+            last_chapter,
+        },
+        NavOutcome::VerseOutOfRange { last_verse } => NavCommandResult::VerseOutOfRange {
+            book_name: book_name(),
+            chapter: req_chapter,
+            requested: req_verse,
+            last_verse,
+        },
+        NavOutcome::AtBibleBoundary | NavOutcome::LookupFailed => NavCommandResult::NoChange,
+    })
+}
+
+/// Relative navigation (Bullet V4): step `count` verses or chapters in either
+/// direction. Moves as far as possible; returns the resolved verse or `NoChange`
+/// at a Bible boundary / cold cursor.
+#[tauri::command]
+pub fn step_verses(
+    unit: NavUnit,
+    direction: NavDirection,
+    count: u16,
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    use crate::nav_lookup::BibleDbVerseLookup;
+
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let Some(tid) = resolve_tid(db, &cursor.position().translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let lookup = BibleDbVerseLookup::new(db);
+    let outcome = cursor.step_n(&lookup, unit, direction, count);
+
+    Ok(match outcome {
+        NavOutcome::Moved => match nav_verse_at(db, tid, cursor.position()) {
+            Some(verse) => NavCommandResult::Moved { verse },
+            None => NavCommandResult::NoChange,
+        },
+        _ => NavCommandResult::NoChange,
+    })
+}
+
+/// Undo the most recent navigation (Way 4 undo backstop). Calls
+/// `CursorState::back()`, which pops the last entry from the undo history and
+/// returns the cursor to the previous position. Returns the reverted verse
+/// (status `"moved"`) when the history had an entry, or `"no_change"` when
+/// the history is empty or the cursor is cold / the DB is unavailable.
+#[tauri::command]
+pub fn undo_navigation(
+    state: State<'_, Mutex<AppState>>,
+    reading: State<'_, Mutex<ReadingMode>>,
+) -> Result<NavCommandResult, String> {
+    exit_reading_mode(&reading);
+
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    let AppState {
+        cursor, bible_db, ..
+    } = &mut *app_state;
+    let (Some(cursor), Some(db)) = (cursor.as_mut(), bible_db.as_ref()) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    let Some(tid) = resolve_tid(db, &cursor.position().translation) else {
+        return Ok(NavCommandResult::NoChange);
+    };
+
+    if !cursor.back() {
+        return Ok(NavCommandResult::NoChange);
+    }
+
+    Ok(match nav_verse_at(db, tid, cursor.position()) {
+        Some(verse) => NavCommandResult::Moved { verse },
+        None => NavCommandResult::NoChange,
+    })
+}
+
+/// Set the pastor's pre-service sermon notes (Phase 5, Bullet 5.2). Parses the
+/// notes for explicit verse references and stores a priming index in `AppState`;
+/// those verses receive a +0.25 boost in later suggestion ranking. Returns the
+/// number of primed verse coordinates (for an operator-facing confirmation).
+/// Rebuilds the index on every call (pastor may edit notes mid-service).
+#[tauri::command]
+pub fn set_sermon_notes(notes: String, state: State<'_, Mutex<AppState>>) -> Result<usize, String> {
+    let index = PrimingIndex::build_from_notes(&notes);
+    let count = index.len();
+    let mut app_state = state.lock().map_err(|e| e.to_string())?;
+    app_state.priming_index = index;
+    log::info!("priming: set_sermon_notes indexed {count} primed verse(s)");
+    Ok(count)
+}
+
+/// Operator dismisses a proactive suggestion (Phase 5, Bullet 5.3). The verse is
+/// suppressed from further suggestions for the rest of the service.
+#[tauri::command]
+pub fn dismiss_suggestion(
+    book: String,
+    chapter: i32,
+    verse: i32,
+    engine: State<'_, Mutex<crate::suggestion::SuggestionEngine>>,
+) -> Result<(), String> {
+    engine
+        .lock()
+        .map_err(|e| e.to_string())?
+        .dismiss(&book, chapter, verse);
+    log::info!("suggestion: dismissed {book} {chapter}:{verse} for the service");
+    Ok(())
 }
 
 fn source_to_string(source: &rhema_detection::DetectionSource) -> String {
@@ -43,25 +443,58 @@ pub fn to_result(state: &AppState, merged: &MergedDetection) -> DetectionResult 
                 (r, v.text, v.book_name, v.book_number, v.chapter, v.verse)
             } else {
                 let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                (
+                    r,
+                    String::new(),
+                    vr.book_name.clone(),
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                )
             }
         } else if let Some(ref db) = state.bible_db {
             // Direct detection: resolve via book/chapter/verse
             if vr.book_number > 0 && vr.chapter > 0 && vr.verse_start > 0 {
-                if let Ok(Some(v)) = db.get_verse(state.active_translation_id, vr.book_number, vr.chapter, vr.verse_start) {
+                if let Ok(Some(v)) = db.get_verse(
+                    state.active_translation_id,
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                ) {
                     let r = format!("{} {}:{}", v.book_name, v.chapter, v.verse);
                     (r, v.text, v.book_name, v.book_number, v.chapter, v.verse)
                 } else {
                     let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                    (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                    (
+                        r,
+                        String::new(),
+                        vr.book_name.clone(),
+                        vr.book_number,
+                        vr.chapter,
+                        vr.verse_start,
+                    )
                 }
             } else {
                 let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-                (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+                (
+                    r,
+                    String::new(),
+                    vr.book_name.clone(),
+                    vr.book_number,
+                    vr.chapter,
+                    vr.verse_start,
+                )
             }
         } else {
             let r = format!("{} {}:{}", vr.book_name, vr.chapter, vr.verse_start);
-            (r, String::new(), vr.book_name.clone(), vr.book_number, vr.chapter, vr.verse_start)
+            (
+                r,
+                String::new(),
+                vr.book_name.clone(),
+                vr.book_number,
+                vr.chapter,
+                vr.verse_start,
+            )
         };
 
     DetectionResult {
@@ -74,8 +507,67 @@ pub fn to_result(state: &AppState, merged: &MergedDetection) -> DetectionResult 
         confidence: merged.detection.confidence,
         source: source_to_string(&merged.detection.source),
         auto_queued: merged.auto_queued,
+        raw_score: merged.decision.raw_score,
+        minimum_threshold: merged.decision.minimum_threshold,
+        auto_queue_threshold: merged.decision.auto_queue_threshold,
+        decision: merged.decision.decision.to_string(),
+        explanation: merged.decision.explanation.clone(),
         transcript_snippet: merged.detection.transcript_snippet.clone(),
+        // Authoritative by default; the live direct path overrides this to `false` for
+        // detections derived from interim/partial transcripts.
+        is_final: true,
     }
+}
+
+pub fn live_detection_metadata(
+    source: &str,
+    confidence: f64,
+    auto_queued: bool,
+) -> (f64, f64, f64, String, String) {
+    let (minimum_threshold, auto_queue_threshold, label) = match source {
+        "direct" => (0.45, 0.90, "direct reference"),
+        "contextual" => (0.45, 0.80, "reading context"),
+        "quotation" => (0.45, 0.85, "quotation match"),
+        "semantic_cloud" => (0.55, 0.90, "cloud semantic search"),
+        _ => (0.50, 0.92, "local semantic search"),
+    };
+    let decision = if auto_queued {
+        "auto_queued"
+    } else {
+        "review_required"
+    };
+    let explanation = if auto_queued {
+        format!(
+            "{label} confidence {:.0}% met the {:.0}% auto-queue threshold.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        )
+    } else {
+        format!(
+            "{label} confidence {:.0}% is below the {:.0}% auto-queue threshold; operator review required.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        )
+    };
+
+    (
+        confidence,
+        minimum_threshold,
+        auto_queue_threshold,
+        decision.to_string(),
+        explanation,
+    )
+}
+
+/// Register an operator manual action (Phase 3, Bullet 3.2): bump the epoch
+/// lock so in-flight voice detections are discarded for the lock window.
+///
+/// The frontend should call this whenever the operator manually picks,
+/// projects, or navigates a verse, so the operator's choice wins over a voice
+/// detection that arrives a few hundred ms later. Returns the new epoch.
+#[tauri::command]
+pub fn acquire_operator_lock(epoch: State<'_, EpochLock>) -> u64 {
+    epoch.acquire()
 }
 
 /// Run the detection pipeline on a piece of transcript text
@@ -148,7 +640,10 @@ pub fn semantic_search(
         return Err("Semantic search not available — model or embeddings not loaded".into());
     }
 
-    let hits = app_state.detection_pipeline.semantic.search_query(&query, k);
+    let hits = app_state
+        .detection_pipeline
+        .semantic
+        .search_query(&query, k);
 
     let mut results: Vec<SemanticSearchResult> = hits
         .into_iter()
@@ -171,7 +666,11 @@ pub fn semantic_search(
         .collect();
 
     // Ensure highest similarity is always first
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Ok(results)
 }
@@ -259,9 +758,7 @@ pub struct ReadingModeStatus {
 
 /// Stop reading mode
 #[tauri::command]
-pub fn stop_reading_mode(
-    state: State<'_, Mutex<ReadingMode>>,
-) -> Result<(), String> {
+pub fn stop_reading_mode(state: State<'_, Mutex<ReadingMode>>) -> Result<(), String> {
     let mut rm = state.lock().map_err(|e| e.to_string())?;
     rm.deactivate();
     Ok(())

@@ -14,6 +14,8 @@ pub struct AudioConfig {
     pub device_id: Option<String>,
     pub sample_rate: u32,
     pub gain: f32,
+    pub channel_index: Option<u16>,
+    pub vad_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

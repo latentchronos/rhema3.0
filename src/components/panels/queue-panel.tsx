@@ -7,8 +7,9 @@ import {
   XIcon,
   GripVerticalIcon,
 } from "lucide-react"
-import { useQueueStore, useBroadcastStore, useBibleStore } from "@/stores"
-import { toVerseRenderData } from "@/hooks/use-broadcast"
+import { useQueueStore, useBibleStore } from "@/stores"
+import { commitLiveVerse } from "@/hooks/use-broadcast"
+import { acquireOperatorLock } from "@/lib/operator-lock"
 import { bibleActions } from "@/hooks/use-bible"
 import type { QueueItem } from "@/types"
 
@@ -20,10 +21,11 @@ function QueueItemRow({
   isActive: boolean
 }) {
   const handlePresent = () => {
+    acquireOperatorLock()
     bibleActions.selectVerse(item.verse)
     const translation = useBibleStore.getState().translations
       .find(t => t.id === useBibleStore.getState().activeTranslationId)?.abbreviation ?? "KJV"
-    useBroadcastStore.getState().setLiveVerse(toVerseRenderData(item.verse, translation))
+    commitLiveVerse(item.verse, translation)
   }
 
   const handleRemove = () => {

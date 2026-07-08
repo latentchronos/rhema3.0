@@ -2,7 +2,7 @@ import { useRef, useEffect } from "react"
 import { PanelHeader } from "@/components/ui/panel-header"
 import { LevelMeter } from "@/components/ui/level-meter"
 import { Button } from "@/components/ui/button"
-import { MicIcon, MicOffIcon } from "lucide-react"
+import { MicIcon, MicOffIcon, DownloadIcon } from "lucide-react"
 import { invoke } from "@tauri-apps/api/core"
 import {
   useTranscriptStore,
@@ -33,13 +33,20 @@ export function TranscriptPanel() {
 
   // Connection status events
   useTauriEvent("stt_connected", () => {
-    useTranscriptStore.getState().setConnectionStatus("connected")
+    const t = useTranscriptStore.getState()
+    t.setConnectionStatus("connected")
+    t.setDegradedMode(false) // recovered from any REST fallback
   })
   useTauriEvent("stt_disconnected", () => {
     useTranscriptStore.getState().setConnectionStatus("disconnected")
   })
-  useTauriEvent<string>("stt_error", () => {
-    useTranscriptStore.getState().setConnectionStatus("error")
+  useTauriEvent<string>("stt_error", (msg) => {
+    const t = useTranscriptStore.getState()
+    t.setConnectionStatus("error")
+    // Latch a persistent "degraded" indicator when we drop to REST/Hybrid mode.
+    if (/hybrid|rest/i.test(msg ?? "")) {
+      t.setDegradedMode(true)
+    }
   })
 
   useTauriEvent<{ text: string; is_final: boolean; confidence: number }>(
@@ -77,10 +84,17 @@ export function TranscriptPanel() {
   useTauriEvent<DetectionResult[]>("verse_detections", (detections) => {
     useDetectionStore.getState().addDetections(detections)
 
-    // Auto-navigate book search + select verse for preview/live
-    // Handle direct, contextual (reading mode), and high-confidence quotation matches
+    // Auto-navigate book search + select verse for preview/live.
+    // Handle direct, contextual (reading mode), and high-confidence quotation matches.
+    // Committed-only projection (RHEMA_V2_ARCHITECTURE §4): only authoritative
+    // (is_final) detections may move the preview/live panels. Partial-derived detections
+    // still show in the panel below (addDetections above) but never drive selection.
     const directHit = detections.find(
-      (d) => d.source === "direct" || d.source === "contextual" || (d.source === "quotation" && d.auto_queued)
+      (d) =>
+        d.is_final &&
+        (d.source === "direct" ||
+          d.source === "contextual" ||
+          (d.source === "quotation" && d.auto_queued))
     )
     if (directHit && directHit.book_number > 0) {
       // Select verse immediately so preview/live panels update
@@ -95,18 +109,16 @@ export function TranscriptPanel() {
         text: directHit.verse_text,
       })
       // Navigate book search panel to this verse
-      useBibleStore
-        .getState()
-        .setPendingNavigation({
-          bookNumber: directHit.book_number,
-          chapter: directHit.chapter,
-          verse: directHit.verse,
-        })
+      useBibleStore.getState().setPendingNavigation({
+        bookNumber: directHit.book_number,
+        chapter: directHit.chapter,
+        verse: directHit.verse,
+      })
     }
 
-    // Auto-queue high-confidence detections
+    // Auto-queue high-confidence detections — committed/final only, never from partials.
     for (const d of detections) {
-      if (d.auto_queued) {
+      if (d.auto_queued && d.is_final) {
         useQueueStore.getState().addItem({
           id: crypto.randomUUID(),
           verse: {
@@ -121,7 +133,12 @@ export function TranscriptPanel() {
           },
           reference: d.verse_ref,
           confidence: d.confidence,
-          source: d.source === "direct" ? "ai-direct" : "ai-semantic",
+          source:
+            d.source === "direct" || d.source === "contextual"
+              ? "ai-direct"
+              : d.source === "semantic_cloud"
+                ? "ai-cloud"
+                : "ai-semantic",
           added_at: Date.now(),
         })
       }
@@ -140,11 +157,22 @@ export function TranscriptPanel() {
       useTranscriptStore.getState().setConnectionStatus("connecting")
       const { useSettingsStore } = await import("@/stores")
       const settings = useSettingsStore.getState()
-      console.log("[AUDIO] Starting with deviceId:", settings.audioDeviceId, "gain:", settings.gain)
+      console.log(
+        "[AUDIO] Starting with deviceId:",
+        settings.audioDeviceId,
+        "gain:",
+        settings.gain,
+        "channel:",
+        settings.audioChannelIndex,
+        "vad:",
+        settings.vadEnabled
+      )
       await invoke("start_transcription", {
         apiKey: deepgramApiKey ?? "",
         deviceId: settings.audioDeviceId,
         gain: settings.gain,
+        channelIndex: settings.audioChannelIndex,
+        vadEnabled: settings.vadEnabled,
       })
       useTranscriptStore.getState().setTranscribing(true)
     } catch (e) {
@@ -165,6 +193,25 @@ export function TranscriptPanel() {
     }
   }
 
+  const exportTranscript = () => {
+    const segs = useTranscriptStore.getState().segments
+    if (segs.length === 0) return
+    const stamp = new Date()
+    const header = `Rhema transcript — exported ${stamp.toLocaleString()}\n${"=".repeat(48)}\n\n`
+    const body = segs.map((s) => s.text).join("\n")
+    const blob = new Blob([header + body + "\n"], {
+      type: "text/plain;charset=utf-8",
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = `rhema-transcript-${stamp.toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  }
+
   return (
     <div
       data-slot="transcript-panel"
@@ -175,6 +222,16 @@ export function TranscriptPanel() {
         icon={<MicIcon className="size-3" />}
       >
         <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            title="Export transcript"
+            aria-label="Export transcript"
+            disabled={segments.length === 0}
+            onClick={exportTranscript}
+          >
+            <DownloadIcon className="size-3.5" />
+          </Button>
           {isTranscribing && (
             <span
               className={`size-2 rounded-full ${
@@ -249,7 +306,7 @@ export function TranscriptPanel() {
           </Button>
         ) : (
           <Button variant="ghost" size="sm" onClick={handleStart}>
-              <MicIcon className="size-3" />
+            <MicIcon className="size-3" />
             Start transcribing
           </Button>
         )}

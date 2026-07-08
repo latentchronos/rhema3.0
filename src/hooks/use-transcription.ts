@@ -1,6 +1,6 @@
 import { useCallback } from "react"
 import { invoke } from "@tauri-apps/api/core"
-import { useTranscriptStore } from "@/stores"
+import { useSettingsStore, useTranscriptStore } from "@/stores"
 import { useTauriEvent } from "./use-tauri-event"
 import type { TranscriptSegment } from "@/types"
 
@@ -31,7 +31,15 @@ export function useTranscription() {
   })
 
   const startTranscription = useCallback(async () => {
-    await invoke("start_transcription")
+    const settings = useSettingsStore.getState()
+    await invoke("start_transcription", {
+      apiKey: settings.deepgramApiKey ?? "",
+      deviceId: settings.audioDeviceId,
+      gain: settings.gain,
+      channelIndex: settings.audioChannelIndex,
+      vadEnabled: settings.vadEnabled,
+      commandWakeWord: settings.commandWakeWord ?? null,
+    })
     store.setTranscribing(true)
   }, [store])
 

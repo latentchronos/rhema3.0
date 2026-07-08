@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback } from "react"
 import { invoke } from "@tauri-apps/api/core"
 import { emitTo, listen } from "@tauri-apps/api/event"
-import { availableMonitors, getAllWindows, type Monitor } from '@tauri-apps/api/window'
+import {
+  availableMonitors,
+  getAllWindows,
+  type Monitor,
+} from "@tauri-apps/api/window"
 import {
   Dialog,
   DialogContent,
@@ -22,7 +26,14 @@ import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
 import { useBroadcastStore } from "@/stores"
-import type { NdiAlphaMode, NdiFrameRate, NdiResolution, NdiSessionInfo, NdiStartRequest } from "@/types"
+import type {
+  NdiAlphaMode,
+  NdiFrameRate,
+  NdiResolution,
+  NdiSessionInfo,
+  NdiStartRequest,
+  ObsOverlayStatus,
+} from "@/types"
 import {
   MonitorIcon,
   CastIcon,
@@ -30,9 +41,11 @@ import {
   EyeOffIcon,
   RefreshCwIcon,
   RadioIcon,
+  GlobeIcon,
+  CopyIcon,
 } from "lucide-react"
 
-type OutputType = "display" | "ndi"
+type OutputType = "display" | "ndi" | "obs"
 
 const NDI_RESOLUTION_OPTIONS: Array<{ value: NdiResolution; label: string }> = [
   { value: "r1080p", label: "1080p (1920×1080)" },
@@ -83,9 +96,13 @@ export function BroadcastSettings({
   const [ndiSourceName, setNdiSourceName] = useState("Rhema Output")
   const [ndiResolution, setNdiResolution] = useState<NdiResolution>("r1080p")
   const [ndiFrameRate, setNdiFrameRate] = useState<NdiFrameRate>("fps24")
-  const [ndiAlphaMode, setNdiAlphaMode] = useState<NdiAlphaMode>("straightAlpha")
+  const [ndiAlphaMode, setNdiAlphaMode] =
+    useState<NdiAlphaMode>("straightAlpha")
   const [ndiActive, setNdiActive] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [obsActive, setObsActive] = useState(false)
+  const [obsMainUrl, setObsMainUrl] = useState("")
+  const [obsAltUrl, setObsAltUrl] = useState("")
 
   // Alternate output state
   const altActiveThemeId = useBroadcastStore((s) => s.altActiveThemeId)
@@ -95,10 +112,23 @@ export function BroadcastSettings({
   const [altSelectedMonitor, setAltSelectedMonitor] = useState("0")
   const [altIsPreviewOpen, setAltIsPreviewOpen] = useState(false)
   const [altNdiSourceName, setAltNdiSourceName] = useState("Rhema Alt")
-  const [altNdiResolution, setAltNdiResolution] = useState<NdiResolution>("r1080p")
+  const [altNdiResolution, setAltNdiResolution] =
+    useState<NdiResolution>("r1080p")
   const [altNdiFrameRate, setAltNdiFrameRate] = useState<NdiFrameRate>("fps24")
-  const [altNdiAlphaMode, setAltNdiAlphaMode] = useState<NdiAlphaMode>("straightAlpha")
+  const [altNdiAlphaMode, setAltNdiAlphaMode] =
+    useState<NdiAlphaMode>("straightAlpha")
   const [altNdiActive, setAltNdiActive] = useState(false)
+
+  const refreshObsStatus = useCallback(async () => {
+    try {
+      const status = await invoke<ObsOverlayStatus>("get_obs_overlay_status")
+      setObsActive(status.active)
+      setObsMainUrl(status.mainUrl ?? "")
+      setObsAltUrl(status.altUrl ?? "")
+    } catch {
+      setObsActive(false)
+    }
+  }, [])
 
   const syncBroadcastOutput = useCallback(() => {
     useBroadcastStore.getState().syncBroadcastOutput()
@@ -109,7 +139,7 @@ export function BroadcastSettings({
       outputId: string,
       active: boolean,
       frameRate: NdiFrameRate,
-      resolution: NdiResolution,
+      resolution: NdiResolution
     ) => {
       const label = outputId === "alt" ? "broadcast-alt" : "broadcast"
       const dims =
@@ -125,14 +155,17 @@ export function BroadcastSettings({
         height: dims.height,
       }).catch(() => {})
     },
-    [],
+    []
   )
 
-  const reconcilePreviewState = useCallback(async (outputId: string = "main") => {
-    const label = outputId === "alt" ? "broadcast-alt" : "broadcast"
-    const windows = await getAllWindows()
-    return windows.some((w) => w.label === label)
-  }, [])
+  const reconcilePreviewState = useCallback(
+    async (outputId: string = "main") => {
+      const label = outputId === "alt" ? "broadcast-alt" : "broadcast"
+      const windows = await getAllWindows()
+      return windows.some((w) => w.label === label)
+    },
+    []
+  )
 
   const fetchMonitors = useCallback(async () => {
     setRefreshing(true)
@@ -152,7 +185,8 @@ export function BroadcastSettings({
 
   useEffect(() => {
     if (open) fetchMonitors()
-  }, [open, fetchMonitors])
+    if (open) void refreshObsStatus()
+  }, [open, fetchMonitors, refreshObsStatus])
 
   // Sync theme selection with broadcast store
   useEffect(() => {
@@ -166,7 +200,12 @@ export function BroadcastSettings({
     const unlistenPromise = listen("broadcast:output-ready", () => {
       useBroadcastStore.getState().syncBroadcastOutput()
       syncNdiConfigToOutput("main", ndiActive, ndiFrameRate, ndiResolution)
-      syncNdiConfigToOutput("alt", altNdiActive, altNdiFrameRate, altNdiResolution)
+      syncNdiConfigToOutput(
+        "alt",
+        altNdiActive,
+        altNdiFrameRate,
+        altNdiResolution
+      )
       timeoutId = setTimeout(() => {
         useBroadcastStore.getState().syncBroadcastOutput()
       }, 150)
@@ -237,7 +276,9 @@ export function BroadcastSettings({
         syncNdiConfigToOutput("main", false, ndiFrameRate, ndiResolution)
         setNdiActive(false)
         if (!isPreviewOpen) {
-          await invoke("close_broadcast_window", { outputId: "main" }).catch(() => {})
+          await invoke("close_broadcast_window", { outputId: "main" }).catch(
+            () => {}
+          )
         }
       } else {
         await invoke("ensure_broadcast_window", { outputId: "main" })
@@ -247,7 +288,10 @@ export function BroadcastSettings({
           frameRate: ndiFrameRate,
           alphaMode: ndiAlphaMode,
         }
-        const session = await invoke<NdiSessionInfo>("start_ndi", { outputId: "main", request })
+        const session = await invoke<NdiSessionInfo>("start_ndi", {
+          outputId: "main",
+          request,
+        })
         setNdiActive(true)
         useBroadcastStore.getState().syncBroadcastOutputFor("main")
         void emitTo("broadcast", "broadcast:ndi-config", {
@@ -264,6 +308,26 @@ export function BroadcastSettings({
     } catch {
       // Command may not exist yet
     }
+  }
+
+  const handleToggleObs = async () => {
+    try {
+      if (obsActive) {
+        await invoke("stop_obs_overlay")
+      } else {
+        await invoke<ObsOverlayStatus>("start_obs_overlay", { port: null })
+        useBroadcastStore.getState().syncBroadcastOutput()
+      }
+      await refreshObsStatus()
+    } catch (error) {
+      console.warn("Failed to toggle OBS overlay", error)
+    }
+  }
+
+  const copyObsUrl = async (outputId: "main" | "alt") => {
+    const url = outputId === "alt" ? obsAltUrl : obsMainUrl
+    if (!url) return
+    await navigator.clipboard?.writeText(url).catch(() => {})
   }
 
   const handleMainToggle = async (enabled: boolean) => {
@@ -310,7 +374,12 @@ export function BroadcastSettings({
         setAltIsPreviewOpen(opened)
         if (!opened) return
         useBroadcastStore.getState().syncBroadcastOutputFor("alt")
-        syncNdiConfigToOutput("alt", altNdiActive, altNdiFrameRate, altNdiResolution)
+        syncNdiConfigToOutput(
+          "alt",
+          altNdiActive,
+          altNdiFrameRate,
+          altNdiResolution
+        )
         setTimeout(() => {
           useBroadcastStore.getState().syncBroadcastOutputFor("alt")
         }, 150)
@@ -327,7 +396,9 @@ export function BroadcastSettings({
         syncNdiConfigToOutput("alt", false, altNdiFrameRate, altNdiResolution)
         setAltNdiActive(false)
         if (!altIsPreviewOpen) {
-          await invoke("close_broadcast_window", { outputId: "alt" }).catch(() => {})
+          await invoke("close_broadcast_window", { outputId: "alt" }).catch(
+            () => {}
+          )
         }
       } else {
         await invoke("ensure_broadcast_window", { outputId: "alt" })
@@ -337,7 +408,10 @@ export function BroadcastSettings({
           frameRate: altNdiFrameRate,
           alphaMode: altNdiAlphaMode,
         }
-        const session = await invoke<NdiSessionInfo>("start_ndi", { outputId: "alt", request })
+        const session = await invoke<NdiSessionInfo>("start_ndi", {
+          outputId: "alt",
+          request,
+        })
         setAltNdiActive(true)
         useBroadcastStore.getState().syncBroadcastOutputFor("alt")
         void emitTo("broadcast-alt", "broadcast:ndi-config", {
@@ -360,7 +434,9 @@ export function BroadcastSettings({
     setAltEnabled(enabled)
     if (!enabled) {
       if (altIsPreviewOpen) {
-        await invoke("close_broadcast_window", { outputId: "alt" }).catch(() => {})
+        await invoke("close_broadcast_window", { outputId: "alt" }).catch(
+          () => {}
+        )
         setAltIsPreviewOpen(false)
       }
       if (altNdiActive) {
@@ -373,10 +449,7 @@ export function BroadcastSettings({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
-        className="sm:max-w-[700px] gap-4"
-        showCloseButton={true}
-      >
+      <DialogContent className="gap-4 sm:max-w-[700px]" showCloseButton={true}>
         <DialogHeader>
           <DialogTitle>Broadcast</DialogTitle>
           <DialogDescription>
@@ -386,7 +459,7 @@ export function BroadcastSettings({
 
         <div className="grid grid-cols-2 gap-4">
           {/* ── Main Output Card ── */}
-          <div className="rounded-lg border border-border bg-card p-4 space-y-4">
+          <div className="space-y-4 rounded-lg border border-border bg-card p-4">
             {/* Card header */}
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -412,10 +485,7 @@ export function BroadcastSettings({
             {/* Theme selector */}
             <div className="space-y-1.5">
               <label className="text-xs text-muted-foreground">Theme</label>
-              <Select
-                value={mainThemeId}
-                onValueChange={handleMainThemeChange}
-              >
+              <Select value={mainThemeId} onValueChange={handleMainThemeChange}>
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -434,7 +504,7 @@ export function BroadcastSettings({
               <label className="text-xs text-muted-foreground">
                 Output Type
               </label>
-              <div className="grid grid-cols-2 gap-1.5">
+              <div className="grid grid-cols-3 gap-1.5">
                 <button
                   onClick={() => setOutputType("display")}
                   className={cn(
@@ -459,6 +529,18 @@ export function BroadcastSettings({
                   <RadioIcon className="size-3.5" />
                   NDI
                 </button>
+                <button
+                  onClick={() => setOutputType("obs")}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium transition-all",
+                    outputType === "obs"
+                      ? "border-lime-500/50 bg-lime-500/15 text-lime-400"
+                      : "border-border bg-background text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <GlobeIcon className="size-3.5" />
+                  OBS
+                </button>
               </div>
             </div>
 
@@ -478,10 +560,7 @@ export function BroadcastSettings({
                       className="h-5 gap-1 px-1.5 text-[0.625rem] text-muted-foreground"
                     >
                       <RefreshCwIcon
-                        className={cn(
-                          "size-3",
-                          refreshing && "animate-spin"
-                        )}
+                        className={cn("size-3", refreshing && "animate-spin")}
                       />
                       Refresh
                     </Button>
@@ -533,14 +612,18 @@ export function BroadcastSettings({
                   )}
                 </Button>
               </div>
-            ) : (
+            ) : outputType === "ndi" ? (
               <div className="space-y-3">
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
-                    <label className="text-xs text-muted-foreground">Resolution</label>
+                    <label className="text-xs text-muted-foreground">
+                      Resolution
+                    </label>
                     <Select
                       value={ndiResolution}
-                      onValueChange={(value) => setNdiResolution(value as NdiResolution)}
+                      onValueChange={(value) =>
+                        setNdiResolution(value as NdiResolution)
+                      }
                     >
                       <SelectTrigger className="w-full">
                         <SelectValue />
@@ -556,10 +639,14 @@ export function BroadcastSettings({
                   </div>
 
                   <div className="space-y-1.5">
-                    <label className="text-xs text-muted-foreground">Frame Rate</label>
+                    <label className="text-xs text-muted-foreground">
+                      Frame Rate
+                    </label>
                     <Select
                       value={ndiFrameRate}
-                      onValueChange={(value) => setNdiFrameRate(value as NdiFrameRate)}
+                      onValueChange={(value) =>
+                        setNdiFrameRate(value as NdiFrameRate)
+                      }
                     >
                       <SelectTrigger className="w-full">
                         <SelectValue />
@@ -576,10 +663,14 @@ export function BroadcastSettings({
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">Alpha Channel</label>
+                  <label className="text-xs text-muted-foreground">
+                    Alpha Channel
+                  </label>
                   <Select
                     value={ndiAlphaMode}
-                    onValueChange={(value) => setNdiAlphaMode(value as NdiAlphaMode)}
+                    onValueChange={(value) =>
+                      setNdiAlphaMode(value as NdiAlphaMode)
+                    }
                   >
                     <SelectTrigger className="w-full">
                       <SelectValue />
@@ -595,7 +686,9 @@ export function BroadcastSettings({
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">Source Name</label>
+                  <label className="text-xs text-muted-foreground">
+                    Source Name
+                  </label>
                   <Input
                     value={ndiSourceName}
                     onChange={(e) => setNdiSourceName(e.target.value)}
@@ -608,7 +701,7 @@ export function BroadcastSettings({
                   className={cn(
                     "w-full gap-1.5",
                     ndiActive &&
-                    "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400"
+                      "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400"
                   )}
                   onClick={handleToggleNdi}
                 >
@@ -625,39 +718,89 @@ export function BroadcastSettings({
                   )}
                 </Button>
               </div>
+            ) : (
+              <div className="space-y-3">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={cn(
+                    "w-full gap-1.5",
+                    obsActive &&
+                      "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400"
+                  )}
+                  onClick={handleToggleObs}
+                >
+                  <GlobeIcon className="size-3.5" />
+                  {obsActive ? "Stop OBS Overlay" : "Start OBS Overlay"}
+                </Button>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-muted-foreground">
+                    Browser Source URL
+                  </label>
+                  <div className="flex gap-1.5">
+                    <Input
+                      value={obsMainUrl}
+                      readOnly
+                      placeholder="Start OBS overlay"
+                    />
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      disabled={!obsMainUrl}
+                      onClick={() => copyObsUrl("main")}
+                    >
+                      <CopyIcon className="size-3.5" />
+                    </Button>
+                  </div>
+                </div>
+              </div>
             )}
           </div>
 
           {/* ── Alternate Output Card ── */}
-          <div className="rounded-lg border border-border bg-card p-4 space-y-4">
+          <div className="space-y-4 rounded-lg border border-border bg-card p-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <CastIcon className="size-4 text-muted-foreground" />
                 <span className="text-sm font-medium">Alternate Output</span>
               </div>
               <div className="flex items-center gap-2">
-                <span className={cn("text-xs", altEnabled ? "text-foreground" : "text-muted-foreground")}>
+                <span
+                  className={cn(
+                    "text-xs",
+                    altEnabled ? "text-foreground" : "text-muted-foreground"
+                  )}
+                >
                   {altEnabled ? "On" : "Off"}
                 </span>
-                <Switch checked={altEnabled} onCheckedChange={handleAltToggle} />
+                <Switch
+                  checked={altEnabled}
+                  onCheckedChange={handleAltToggle}
+                />
               </div>
             </div>
 
             <div className="space-y-1.5">
               <label className="text-xs text-muted-foreground">Theme</label>
               <Select value={altThemeId} onValueChange={handleAltThemeChange}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
                 <SelectContent>
                   {themes.map((t) => (
-                    <SelectItem key={t.id} value={t.id}>{t.name}</SelectItem>
+                    <SelectItem key={t.id} value={t.id}>
+                      {t.name}
+                    </SelectItem>
                   ))}
                 </SelectContent>
               </Select>
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">Output Type</label>
-              <div className="grid grid-cols-2 gap-1.5">
+              <label className="text-xs text-muted-foreground">
+                Output Type
+              </label>
+              <div className="grid grid-cols-3 gap-1.5">
                 <button
                   onClick={() => setAltOutputType("display")}
                   className={cn(
@@ -682,6 +825,18 @@ export function BroadcastSettings({
                   <RadioIcon className="size-3.5" />
                   NDI
                 </button>
+                <button
+                  onClick={() => setAltOutputType("obs")}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium transition-all",
+                    altOutputType === "obs"
+                      ? "border-lime-500/50 bg-lime-500/15 text-lime-400"
+                      : "border-border bg-background text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <GlobeIcon className="size-3.5" />
+                  OBS
+                </button>
               </div>
             </div>
 
@@ -689,15 +844,38 @@ export function BroadcastSettings({
               <div className="space-y-3">
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
-                    <label className="text-xs text-muted-foreground">Target Monitor</label>
-                    <Button variant="ghost" size="xs" disabled={refreshing} onClick={fetchMonitors} className="h-5 gap-1 px-1.5 text-[0.625rem] text-muted-foreground">
-                      <RefreshCwIcon className={cn("size-3", refreshing && "animate-spin")} />
+                    <label className="text-xs text-muted-foreground">
+                      Target Monitor
+                    </label>
+                    <Button
+                      variant="ghost"
+                      size="xs"
+                      disabled={refreshing}
+                      onClick={fetchMonitors}
+                      className="h-5 gap-1 px-1.5 text-[0.625rem] text-muted-foreground"
+                    >
+                      <RefreshCwIcon
+                        className={cn("size-3", refreshing && "animate-spin")}
+                      />
                       Refresh
                     </Button>
                   </div>
-                  <Select value={altSelectedMonitor} onValueChange={setAltSelectedMonitor} disabled={monitors.length === 0}>
-                    <SelectTrigger className="w-full" disabled={monitors.length === 0}>
-                      <SelectValue placeholder={monitors.length === 0 ? "No monitors detected" : "Select monitor"} />
+                  <Select
+                    value={altSelectedMonitor}
+                    onValueChange={setAltSelectedMonitor}
+                    disabled={monitors.length === 0}
+                  >
+                    <SelectTrigger
+                      className="w-full"
+                      disabled={monitors.length === 0}
+                    >
+                      <SelectValue
+                        placeholder={
+                          monitors.length === 0
+                            ? "No monitors detected"
+                            : "Select monitor"
+                        }
+                      />
                     </SelectTrigger>
                     <SelectContent>
                       {monitors.map((m, i) => (
@@ -708,53 +886,162 @@ export function BroadcastSettings({
                     </SelectContent>
                   </Select>
                 </div>
-                <Button variant="outline" size="sm" className="w-full gap-1.5" disabled={monitors.length === 0} onClick={handleAltTogglePreview}>
-                  {altIsPreviewOpen ? (<><EyeOffIcon className="size-3.5" />Close Preview</>) : (<><EyeIcon className="size-3.5" />Open Preview</>)}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full gap-1.5"
+                  disabled={monitors.length === 0}
+                  onClick={handleAltTogglePreview}
+                >
+                  {altIsPreviewOpen ? (
+                    <>
+                      <EyeOffIcon className="size-3.5" />
+                      Close Preview
+                    </>
+                  ) : (
+                    <>
+                      <EyeIcon className="size-3.5" />
+                      Open Preview
+                    </>
+                  )}
                 </Button>
               </div>
-            ) : (
+            ) : altOutputType === "ndi" ? (
               <div className="space-y-3">
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
-                    <label className="text-xs text-muted-foreground">Resolution</label>
-                    <Select value={altNdiResolution} onValueChange={(v) => setAltNdiResolution(v as NdiResolution)}>
-                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <label className="text-xs text-muted-foreground">
+                      Resolution
+                    </label>
+                    <Select
+                      value={altNdiResolution}
+                      onValueChange={(v) =>
+                        setAltNdiResolution(v as NdiResolution)
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
-                        {NDI_RESOLUTION_OPTIONS.map((o) => (<SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>))}
+                        {NDI_RESOLUTION_OPTIONS.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </div>
                   <div className="space-y-1.5">
-                    <label className="text-xs text-muted-foreground">Frame Rate</label>
-                    <Select value={altNdiFrameRate} onValueChange={(v) => setAltNdiFrameRate(v as NdiFrameRate)}>
-                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <label className="text-xs text-muted-foreground">
+                      Frame Rate
+                    </label>
+                    <Select
+                      value={altNdiFrameRate}
+                      onValueChange={(v) =>
+                        setAltNdiFrameRate(v as NdiFrameRate)
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
                       <SelectContent>
-                        {NDI_FRAME_RATE_OPTIONS.map((o) => (<SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>))}
+                        {NDI_FRAME_RATE_OPTIONS.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
                       </SelectContent>
                     </Select>
                   </div>
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">Alpha Channel</label>
-                  <Select value={altNdiAlphaMode} onValueChange={(v) => setAltNdiAlphaMode(v as NdiAlphaMode)}>
-                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <label className="text-xs text-muted-foreground">
+                    Alpha Channel
+                  </label>
+                  <Select
+                    value={altNdiAlphaMode}
+                    onValueChange={(v) => setAltNdiAlphaMode(v as NdiAlphaMode)}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
-                      {NDI_ALPHA_OPTIONS.map((o) => (<SelectItem key={o.value} value={o.value}>{o.label}</SelectItem>))}
+                      {NDI_ALPHA_OPTIONS.map((o) => (
+                        <SelectItem key={o.value} value={o.value}>
+                          {o.label}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-xs text-muted-foreground">Source Name</label>
-                  <Input value={altNdiSourceName} onChange={(e) => setAltNdiSourceName(e.target.value)} placeholder="Rhema Alt" />
+                  <label className="text-xs text-muted-foreground">
+                    Source Name
+                  </label>
+                  <Input
+                    value={altNdiSourceName}
+                    onChange={(e) => setAltNdiSourceName(e.target.value)}
+                    placeholder="Rhema Alt"
+                  />
                 </div>
                 <Button
                   variant="outline"
                   size="sm"
-                  className={cn("w-full gap-1.5", altNdiActive && "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400")}
+                  className={cn(
+                    "w-full gap-1.5",
+                    altNdiActive &&
+                      "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400"
+                  )}
                   onClick={handleAltToggleNdi}
                 >
-                  {altNdiActive ? (<><CastIcon className="size-3.5" />Stop NDI</>) : (<><CastIcon className="size-3.5" />Start NDI</>)}
+                  {altNdiActive ? (
+                    <>
+                      <CastIcon className="size-3.5" />
+                      Stop NDI
+                    </>
+                  ) : (
+                    <>
+                      <CastIcon className="size-3.5" />
+                      Start NDI
+                    </>
+                  )}
                 </Button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className={cn(
+                    "w-full gap-1.5",
+                    obsActive &&
+                      "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 hover:text-emerald-400"
+                  )}
+                  onClick={handleToggleObs}
+                >
+                  <GlobeIcon className="size-3.5" />
+                  {obsActive ? "Stop OBS Overlay" : "Start OBS Overlay"}
+                </Button>
+                <div className="space-y-1.5">
+                  <label className="text-xs text-muted-foreground">
+                    Browser Source URL
+                  </label>
+                  <div className="flex gap-1.5">
+                    <Input
+                      value={obsAltUrl}
+                      readOnly
+                      placeholder="Start OBS overlay"
+                    />
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      disabled={!obsAltUrl}
+                      onClick={() => copyObsUrl("alt")}
+                    >
+                      <CopyIcon className="size-3.5" />
+                    </Button>
+                  </div>
+                </div>
               </div>
             )}
           </div>

@@ -11,11 +11,22 @@ const DEFAULT_AUTO_QUEUE_THRESHOLD: f64 = 0.80;
 /// Default cooldown in milliseconds between auto-displayed results.
 const DEFAULT_COOLDOWN_MS: u64 = 2500;
 
-/// A detection after merging, with an auto-queue flag.
+/// Operator-facing decision for a merged detection.
+#[derive(Debug, Clone)]
+pub struct DetectionDecision {
+    pub raw_score: f64,
+    pub minimum_threshold: f64,
+    pub auto_queue_threshold: f64,
+    pub decision: &'static str,
+    pub explanation: String,
+}
+
+/// A detection after merging, with an auto-queue flag and review metadata.
 #[derive(Debug, Clone)]
 pub struct MergedDetection {
     pub detection: Detection,
     pub auto_queued: bool,
+    pub decision: DetectionDecision,
 }
 
 /// Merges results from direct reference detection and semantic search
@@ -86,8 +97,12 @@ impl DetectionMerger {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        // 4. Drop below threshold
-        all.retain(|d| d.confidence >= self.confidence_threshold);
+        // 4. Drop below threshold. Each source can require a stricter
+        // threshold than the global baseline.
+        all.retain(|d| {
+            let policy = source_policy(&d.source);
+            d.confidence >= self.confidence_threshold.max(policy.minimum_threshold)
+        });
 
         // 5 & 6. Build merged list with auto-queue decisions
         let now = Instant::now();
@@ -98,14 +113,37 @@ impl DetectionMerger {
 
         let mut results = Vec::with_capacity(all.len());
         for detection in all {
-            let auto_queued =
-                detection.confidence >= self.auto_queue_threshold && cooldown_ok;
+            let policy = source_policy(&detection.source);
+            let minimum_threshold = self.confidence_threshold.max(policy.minimum_threshold);
+            let auto_queue_threshold = self.auto_queue_threshold.max(policy.auto_queue_threshold);
+            let score = raw_score(&detection);
+            let meets_auto_threshold = detection.confidence >= auto_queue_threshold;
+            let auto_queued = meets_auto_threshold && cooldown_ok;
             if auto_queued {
                 self.last_auto_display = Some(now);
             }
+            let decision = DetectionDecision {
+                raw_score: score,
+                minimum_threshold,
+                auto_queue_threshold,
+                decision: if auto_queued {
+                    "auto_queued"
+                } else {
+                    "review_required"
+                },
+                explanation: decision_explanation(
+                    &detection.source,
+                    detection.confidence,
+                    auto_queue_threshold,
+                    auto_queued,
+                    meets_auto_threshold,
+                    cooldown_ok,
+                ),
+            };
             results.push(MergedDetection {
                 detection,
                 auto_queued,
+                decision,
             });
         }
 
@@ -121,10 +159,8 @@ impl DetectionMerger {
         context: &crate::context::SermonContext,
     ) {
         for detection in detections.iter_mut() {
-            let boost = context.confidence_boost(
-                detection.verse_ref.book_number,
-                detection.verse_ref.chapter,
-            );
+            let boost = context
+                .confidence_boost(detection.verse_ref.book_number, detection.verse_ref.chapter);
             if boost > 0.0 {
                 detection.confidence = (detection.confidence + boost).min(1.0);
             }
@@ -145,6 +181,91 @@ impl DetectionMerger {
     pub fn set_cooldown_ms(&mut self, ms: u64) {
         self.cooldown_ms = ms;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourcePolicy {
+    minimum_threshold: f64,
+    auto_queue_threshold: f64,
+}
+
+fn source_policy(source: &DetectionSource) -> SourcePolicy {
+    match source {
+        DetectionSource::DirectReference => SourcePolicy {
+            minimum_threshold: 0.45,
+            auto_queue_threshold: 0.90,
+        },
+        DetectionSource::Contextual => SourcePolicy {
+            minimum_threshold: 0.45,
+            auto_queue_threshold: 0.80,
+        },
+        DetectionSource::QuotationMatch { .. } => SourcePolicy {
+            minimum_threshold: 0.45,
+            auto_queue_threshold: 0.85,
+        },
+        DetectionSource::SemanticLocal { .. } => SourcePolicy {
+            minimum_threshold: 0.50,
+            auto_queue_threshold: 0.92,
+        },
+        DetectionSource::SemanticCloud { .. } => SourcePolicy {
+            minimum_threshold: 0.55,
+            auto_queue_threshold: 0.90,
+        },
+    }
+}
+
+fn raw_score(detection: &Detection) -> f64 {
+    match detection.source {
+        DetectionSource::QuotationMatch { similarity }
+        | DetectionSource::SemanticLocal { similarity }
+        | DetectionSource::SemanticCloud { similarity } => similarity,
+        DetectionSource::DirectReference | DetectionSource::Contextual => detection.confidence,
+    }
+}
+
+fn source_label(source: &DetectionSource) -> &'static str {
+    match source {
+        DetectionSource::DirectReference => "direct reference",
+        DetectionSource::Contextual => "reading context",
+        DetectionSource::QuotationMatch { .. } => "quotation match",
+        DetectionSource::SemanticLocal { .. } => "local semantic search",
+        DetectionSource::SemanticCloud { .. } => "cloud semantic search",
+    }
+}
+
+fn decision_explanation(
+    source: &DetectionSource,
+    confidence: f64,
+    auto_queue_threshold: f64,
+    auto_queued: bool,
+    meets_auto_threshold: bool,
+    cooldown_ok: bool,
+) -> String {
+    let label = source_label(source);
+    if auto_queued {
+        return format!(
+            "{label} confidence {:.0}% met the {:.0}% auto-queue threshold.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        );
+    }
+
+    if !meets_auto_threshold {
+        return format!(
+            "{label} confidence {:.0}% is below the {:.0}% auto-queue threshold; operator review required.",
+            confidence * 100.0,
+            auto_queue_threshold * 100.0,
+        );
+    }
+
+    if !cooldown_ok {
+        return format!(
+            "{label} confidence {:.0}% met the auto-queue threshold, but cooldown prevented another automatic queue action.",
+            confidence * 100.0,
+        );
+    }
+
+    format!("{label} requires operator review.")
 }
 
 impl Default for DetectionMerger {
@@ -303,8 +424,45 @@ mod tests {
 
         let results = merger.merge(vec![], semantic);
         assert_eq!(results.len(), 1);
-        // 0.50 < 0.80 auto_queue_threshold
+        // 0.50 < semantic-local 0.92 auto_queue_threshold
         assert!(!results[0].auto_queued);
+    }
+
+    #[test]
+    fn test_semantic_high_confidence_auto_queue_uses_source_policy() {
+        let mut merger = DetectionMerger::new();
+
+        let semantic = vec![make_detection(
+            43,
+            "John",
+            3,
+            16,
+            0.93,
+            DetectionSource::SemanticLocal { similarity: 0.93 },
+        )];
+
+        let results = merger.merge(vec![], semantic);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].auto_queued);
+        assert_eq!(results[0].decision.decision, "auto_queued");
+        assert!((results[0].decision.auto_queue_threshold - 0.92).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_semantic_below_source_minimum_is_dropped() {
+        let mut merger = DetectionMerger::new();
+
+        let semantic = vec![make_detection(
+            43,
+            "John",
+            3,
+            16,
+            0.48,
+            DetectionSource::SemanticLocal { similarity: 0.48 },
+        )];
+
+        let results = merger.merge(vec![], semantic);
+        assert!(results.is_empty());
     }
 
     #[test]

@@ -15,4 +15,6 @@ export interface AudioConfig {
   device_id: string | null
   sample_rate: number
   gain: number
+  channel_index: number | null
+  vad_enabled: boolean
 }

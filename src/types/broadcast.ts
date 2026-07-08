@@ -8,12 +8,89 @@ export interface VerseRenderData {
   segments: VerseSegment[]
 }
 
+// --- Phase 4: Channel routing model (mirrors rhema-broadcast channel types) ---
+
+export type RoutingMode = "locked" | "preview" | "independent"
+
+/** A verse rendered for any channel (mirrors rhema_broadcast::VerseDisplay). */
+export interface ChannelVerse {
+  book: string
+  chapter: number
+  verse_start: number
+  verse_end: number | null
+  reference: string
+  text: string
+  translation: string
+}
+
+/** Audience channel cache — committed content only. */
+export interface AudienceChannelState {
+  active_verse: ChannelVerse | null
+  theme_id: string
+}
+
+/** Pastor channel cache — current + optional preview + indicators. */
+export interface PastorChannelState {
+  current_verse: ChannelVerse | null
+  preview_verse: ChannelVerse | null
+  translation: string
+  timer_seconds: number | null
+  mode: RoutingMode
+}
+
+export interface ChannelQueueItem {
+  id: string
+  verse: ChannelVerse
+}
+
+export interface ChannelDetection {
+  verse: ChannelVerse
+  confidence: number
+  source: string
+}
+
+export interface ChannelSuggestion {
+  verse: ChannelVerse
+  score: number
+  reason: string
+}
+
+export type DeviceConnection = "connected" | "disconnected" | "reconnecting"
+
+/** Health of one output endpoint (mirrors rhema_broadcast::DeviceStatus). */
+export interface DeviceStatus {
+  label: string
+  kind: string
+  connection: DeviceConnection
+  /** UNIX-epoch ms of the last connection-state change. */
+  last_change_ms: number
+  /** Verse that was live when this endpoint last disconnected. */
+  last_known_verse: ChannelVerse | null
+}
+
+/** Operator channel cache — supervision surface (operator window only). */
+export interface OperatorChannelState {
+  queue: ChannelQueueItem[]
+  detections: ChannelDetection[]
+  suggestions: ChannelSuggestion[]
+  routing_state: RoutingMode
+  device_health: DeviceStatus[]
+}
+
 export interface RenderOptions {
   opacity?: number
   offsetX?: number
   offsetY?: number
-  scale?: number               // Scale factor for rendering at display size (e.g., 0.42 for 400px panel)
+  scale?: number // Scale factor for rendering at display size (e.g., 0.42 for 400px panel)
   imageCache?: Map<string, HTMLImageElement>
+}
+
+export interface ObsOverlayStatus {
+  active: boolean
+  port: number | null
+  mainUrl: string | null
+  altUrl: string | null
+  clientCount: number
 }
 
 export type TextHorizontalAlign = "left" | "center" | "right" | "justify"

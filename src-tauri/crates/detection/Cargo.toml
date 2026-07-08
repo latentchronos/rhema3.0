@@ -10,12 +10,16 @@ log.workspace = true
 thiserror.workspace = true
 aho-corasick = "1"
 lru = "0.12"
+rphonetic = { version = "3.0.6", features = ["embedded_dm"] }
+# Stage-2 fallback channel only (no runtime/spawn in this crate — the app owns that).
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Optional heavy dependencies for real embedding / vector search
 ort = { version = "2.0.0-rc.12", optional = true }
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.22", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
+hnsw_rs = { version = "0.3", optional = true }
 
 # Dependencies only needed by the precompute binary
 env_logger = { version = "0.11", optional = true }
@@ -23,7 +27,7 @@ env_logger = { version = "0.11", optional = true }
 [features]
 default = []
 onnx = ["ort", "ndarray", "tokenizers"]
-vector-search = ["bytemuck"]
+vector-search = ["bytemuck", "hnsw_rs"]
 precompute-bin = ["onnx", "vector-search", "env_logger"]
 
 [[bin]]

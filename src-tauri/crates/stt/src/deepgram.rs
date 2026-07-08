@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
 use crate::error::SttError;
-use crate::keyterms::bible_keyterms;
+use crate::keyterms::{bible_keyterms, command_keyterms};
 use crate::types::{SttConfig, TranscriptEvent, Word};
 
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
@@ -21,25 +21,46 @@ const BATCH_SAMPLES: usize = 4000;
 
 pub struct DeepgramClient {
     config: SttConfig,
-    cancelled: Arc<AtomicBool>,
 }
 
 impl DeepgramClient {
     pub fn new(config: SttConfig) -> Self {
-        Self {
-            config,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
+        Self { config }
     }
 
     /// Build the Deepgram WebSocket URL with query parameters and keyword boosting.
+    ///
+    /// Runtime overrides (default-off, for A/B accent testing — Task 1.3):
+    ///   RHEMA_DG_MODEL    — if set and non-empty, overrides `config.model`
+    ///   RHEMA_DG_LANGUAGE — if set and non-empty, overrides/appends the `language` param
     fn build_url(&self) -> Result<Url, SttError> {
         let mut url = Url::parse("wss://api.deepgram.com/v1/listen")
             .map_err(|e| SttError::ConnectionFailed(e.to_string()))?;
 
+        // Resolve effective model and language, allowing env-var overrides for A/B testing.
+        let effective_model = std::env::var("RHEMA_DG_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.config.model.clone());
+
+        let env_language = std::env::var("RHEMA_DG_LANGUAGE")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let effective_language: Option<String> = env_language
+            .clone()
+            .or_else(|| self.config.language.clone());
+
+        log::info!(
+            "Deepgram effective model={} language={:?} (env overrides: RHEMA_DG_MODEL={}, RHEMA_DG_LANGUAGE={})",
+            effective_model,
+            effective_language,
+            std::env::var("RHEMA_DG_MODEL").unwrap_or_else(|_| "(unset)".into()),
+            std::env::var("RHEMA_DG_LANGUAGE").unwrap_or_else(|_| "(unset)".into()),
+        );
+
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("model", &self.config.model);
+            q.append_pair("model", &effective_model);
             q.append_pair("encoding", &self.config.encoding);
             q.append_pair("sample_rate", &self.config.sample_rate.to_string());
             q.append_pair("channels", "1");
@@ -50,7 +71,7 @@ impl DeepgramClient {
             q.append_pair("utterance_end_ms", "1000");
             q.append_pair("vad_events", "true");
 
-            if let Some(ref lang) = self.config.language {
+            if let Some(ref lang) = effective_language {
                 q.append_pair("language", lang);
             }
 
@@ -63,12 +84,13 @@ impl DeepgramClient {
                 "Lord".to_string(),
                 "Holy Spirit".to_string(),
             ];
+            let command_terms = command_keyterms();
             let bible_terms = bible_keyterms();
 
-            // Deduplicate: core terms first, then bible_keyterms(), capped at 100.
+            // Deduplicate: core → command → bible, capped at 100.
             let mut seen = std::collections::HashSet::new();
             let mut all_keyterms: Vec<String> = Vec::new();
-            for term in core_terms.into_iter().chain(bible_terms.into_iter()) {
+            for term in core_terms.into_iter().chain(command_terms.into_iter()).chain(bible_terms.into_iter()) {
                 if seen.insert(term.clone()) {
                     all_keyterms.push(term);
                 }
@@ -76,6 +98,7 @@ impl DeepgramClient {
                     break;
                 }
             }
+            debug_assert!(all_keyterms.len() <= 100, "keyterm budget exceeded: {}", all_keyterms.len());
 
             for term in &all_keyterms {
                 q.append_pair("keyterm", term);
@@ -91,32 +114,46 @@ impl DeepgramClient {
     }
 
     /// Connect to Deepgram and stream audio from `audio_rx`, emitting transcript events to `event_tx`.
+    ///
+    /// `keep_running` is the caller's liveness flag: `true` means the user wants
+    /// transcription running; `false` means the user has stopped.  The loop
+    /// reconnects automatically when the server closes the stream (clean `Ok(())`)
+    /// but `keep_running` is still `true`, and returns `Err` after
+    /// `MAX_RECONNECT_ATTEMPTS` consecutive connection errors.
     pub async fn connect(
         &self,
         audio_rx: Receiver<Vec<i16>>,
         event_tx: mpsc::Sender<TranscriptEvent>,
+        keep_running: Arc<AtomicBool>,
     ) -> Result<(), SttError> {
         if self.config.api_key.is_empty() {
             return Err(SttError::ApiKeyMissing);
         }
 
-        let cancelled = self.cancelled.clone();
         let mut attempts: u32 = 0;
 
         loop {
-            if cancelled.load(Ordering::SeqCst) {
-                log::info!("DeepgramClient: cancelled, stopping connection loop");
+            if !keep_running.load(Ordering::SeqCst) {
+                log::info!("DeepgramClient: keep_running=false, stopping connection loop");
                 break;
             }
 
             match self
-                .try_connect(audio_rx.clone(), event_tx.clone(), cancelled.clone())
+                .try_connect(audio_rx.clone(), event_tx.clone(), keep_running.clone())
                 .await
             {
                 Ok(()) => {
-                    // Clean shutdown
-                    log::info!("DeepgramClient: connection closed normally");
-                    break;
+                    if !keep_running.load(Ordering::SeqCst) {
+                        log::info!("DeepgramClient: connection closed (user stopped)");
+                        break;
+                    }
+                    // Server closed the stream but the user still wants to transcribe:
+                    // reconnect and keep the session alive. Reset the error budget since
+                    // we had a working connection.
+                    log::warn!("DeepgramClient: server closed connection unexpectedly; reconnecting");
+                    attempts = 0;
+                    let _ = event_tx.send(TranscriptEvent::Disconnected).await;
+                    tokio::time::sleep(RECONNECT_DELAY).await;
                 }
                 Err(e) => {
                     attempts += 1;
@@ -153,7 +190,7 @@ impl DeepgramClient {
         &self,
         audio_rx: Receiver<Vec<i16>>,
         event_tx: mpsc::Sender<TranscriptEvent>,
-        cancelled: Arc<AtomicBool>,
+        keep_running: Arc<AtomicBool>,
     ) -> Result<(), SttError> {
         let url = self.build_url()?;
 
@@ -178,8 +215,8 @@ impl DeepgramClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        let send_cancelled = cancelled.clone();
-        let recv_cancelled = cancelled.clone();
+        let send_keep_running = keep_running.clone();
+        let recv_keep_running = keep_running.clone();
 
         // Track unexpected disconnects so try_connect returns Err and triggers reconnection.
         let send_error_flag = Arc::new(AtomicBool::new(false));
@@ -205,7 +242,7 @@ impl DeepgramClient {
         // Part 1: Blocking thread reads audio from crossbeam channel
         let audio_reader = {
             let ws_tx = ws_tx.clone();
-            let cancelled = send_cancelled.clone();
+            let keep_running = send_keep_running.clone();
             tokio::task::spawn_blocking(move || {
                 let mut batch_buf: Vec<u8> = Vec::with_capacity(BATCH_SAMPLES * 2);
                 let batch_byte_threshold = BATCH_SAMPLES * 2;
@@ -213,7 +250,7 @@ impl DeepgramClient {
                 let keepalive_interval = Duration::from_secs(5);
 
                 loop {
-                    if cancelled.load(Ordering::SeqCst) {
+                    if !keep_running.load(Ordering::SeqCst) {
                         let _ = ws_tx.blocking_send(WsCommand::Close);
                         break;
                     }
@@ -294,7 +331,7 @@ impl DeepgramClient {
         // Receiver task: reads text frames and parses Deepgram JSON.
         let receiver = tokio::spawn(async move {
             while let Some(msg_result) = read.next().await {
-                if recv_cancelled.load(Ordering::SeqCst) {
+                if !recv_keep_running.load(Ordering::SeqCst) {
                     break;
                 }
 
@@ -335,10 +372,18 @@ impl DeepgramClient {
 
         Ok(())
     }
+}
 
-    /// Cancel the current connection and signal shutdown.
-    pub fn stop(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+#[async_trait::async_trait]
+impl crate::engine::SttEngine for DeepgramClient {
+    /// Forwards to the inherent `connect` — no behavior change for the cloud path.
+    async fn connect(
+        &self,
+        audio_rx: Receiver<Vec<i16>>,
+        event_tx: mpsc::Sender<TranscriptEvent>,
+        keep_running: Arc<AtomicBool>,
+    ) -> Result<(), SttError> {
+        DeepgramClient::connect(self, audio_rx, event_tx, keep_running).await
     }
 }
 

@@ -1,0 +1,27 @@
+{
+  "cases": [
+    {
+      "id": "explicit-john-316",
+      "transcript": "Church, let us look at John chapter three verse sixteen and remember the love of God.",
+      "expected": [
+        { "book": "John", "chapter": 3, "verse": 16 }
+      ],
+      "max_false_positives": 0
+    },
+    {
+      "id": "multiple-direct-references",
+      "transcript": "Compare Romans five eight with first John four nine as we talk about love revealed.",
+      "expected": [
+        { "book": "Romans", "chapter": 5, "verse": 8 },
+        { "book": "1 John", "chapter": 4, "verse": 9 }
+      ],
+      "max_false_positives": 0
+    },
+    {
+      "id": "no-reference-service-language",
+      "transcript": "The worship team can come forward while we prepare our hearts for prayer.",
+      "expected": [],
+      "max_false_positives": 0
+    }
+  ]
+}
