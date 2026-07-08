@@ -39,6 +39,8 @@ export function useTranscription() {
       channelIndex: settings.audioChannelIndex,
       vadEnabled: settings.vadEnabled,
       commandWakeWord: settings.commandWakeWord ?? null,
+      sttModel: settings.sttModel,
+      sttStreaming: settings.sttStreaming,
     })
     store.setTranscribing(true)
   }, [store])

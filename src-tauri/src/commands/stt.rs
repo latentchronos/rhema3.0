@@ -112,6 +112,82 @@ fn default_vad_model_path() -> String {
         .into_owned()
 }
 
+/// One on-device STT model the operator can select in Settings.
+#[derive(serde::Serialize)]
+pub struct SttModelInfo {
+    /// Absolute path to the `.gguf`, passed back as `sttModel` to `start_transcription`.
+    pub path: String,
+    /// Human-friendly label, e.g. "Nemotron · Q8 · streaming".
+    pub label: String,
+    /// Whether it's a streaming model (nemotron) vs offline (parakeet/cohere). Passed back
+    /// as `sttStreaming` so the picker sets the right mode without a separate toggle.
+    pub streaming: bool,
+}
+
+/// List the on-device GGUF models available for selection (the gitignored `model/` dir).
+/// Returns `[]` on a cloud-only build (no `local-stt`) so the Settings dropdown auto-hides.
+#[tauri::command]
+pub fn list_stt_models() -> Vec<SttModelInfo> {
+    #[cfg(not(feature = "local-stt"))]
+    {
+        Vec::new()
+    }
+    #[cfg(feature = "local-stt")]
+    {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../model");
+        let mut out: Vec<SttModelInfo> = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("gguf"))
+                .map(|p| {
+                    let file = p
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let streaming = file.contains("streaming");
+                    SttModelInfo {
+                        label: stt_model_label(&file, streaming),
+                        streaming,
+                        path: p.to_string_lossy().into_owned(),
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                log::warn!("[STT] list_stt_models: cannot read {}: {e}", dir.display());
+                Vec::new()
+            }
+        };
+        // Streaming models first (the default engine), then alphabetical by label.
+        out.sort_by(|a, b| b.streaming.cmp(&a.streaming).then_with(|| a.label.cmp(&b.label)));
+        out
+    }
+}
+
+/// Derive a friendly label from a GGUF filename: family + quant + mode, e.g.
+/// `nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf` → "Nemotron · Q8 · streaming".
+#[cfg(feature = "local-stt")]
+fn stt_model_label(file: &str, streaming: bool) -> String {
+    let stem = file.trim_end_matches(".gguf");
+    let family = {
+        let raw = stem.split('-').next().unwrap_or(stem);
+        let mut chars = raw.chars();
+        match chars.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + chars.as_str(),
+            None => String::new(),
+        }
+    };
+    let quant = stem
+        .split(['-', '_'])
+        .find(|t| t.starts_with('Q') && t[1..].chars().next().is_some_and(|c| c.is_ascii_digit()));
+    let mode = if streaming { "streaming" } else { "offline" };
+    match quant {
+        Some(q) => format!("{family} · {q} · {mode}"),
+        None => format!("{family} · {mode}"),
+    }
+}
+
 /// Start the full audio-capture-to-transcription pipeline.
 ///
 /// 1. Opens the microphone via cpal (on a dedicated thread so the non-Send
@@ -130,6 +206,12 @@ pub async fn start_transcription(
     channel_index: Option<u16>,
     vad_enabled: Option<bool>,
     command_wake_word: Option<String>,
+    // stt_model: on-device model override from the Settings picker (absolute `.gguf` path).
+    // Overrides RHEMA_STT_MODEL; None/empty falls back to the env var, then the default.
+    stt_model: Option<String>,
+    // stt_streaming: whether the selected model is a streaming model. Overrides
+    // RHEMA_STT_STREAM; None falls back to the env var. (Cloud STT ignores both.)
+    stt_streaming: Option<bool>,
 ) -> Result<(), String> {
     // ── 1. Guard: already running? ──────────────────────────────────────
     let (stt_active, audio_active, session_active) = {
@@ -165,13 +247,15 @@ pub async fn start_transcription(
     }
 
     log::info!(
-        "Starting transcription: api_key={}..., device_id={:?}, gain={:?}, channel_index={:?}, vad_enabled={:?}, command_wake_word={:?}",
+        "Starting transcription: api_key={}..., device_id={:?}, gain={:?}, channel_index={:?}, vad_enabled={:?}, command_wake_word={:?}, stt_model={:?}, stt_streaming={:?}",
         &resolved_api_key[..8.min(resolved_api_key.len())],
         device_id,
         gain,
         channel_index,
         vad_enabled,
-        command_wake_word
+        command_wake_word,
+        stt_model,
+        stt_streaming
     );
 
     stt_active.store(true, Ordering::SeqCst);
@@ -345,9 +429,16 @@ pub async fn start_transcription(
         #[cfg(feature = "local-stt")]
         {
             use rhema_stt::SttEngine;
-            let model_path = std::env::var("RHEMA_STT_MODEL").unwrap_or_default();
-            log::info!("[STT] provider=local, model={model_path}");
-            let engine = rhema_stt::LocalSttClient::new(model_path);
+            // UI model picker (stt_model) wins over RHEMA_STT_MODEL, which wins over the
+            // built-in default (resolved inside LocalSttClient when the path is empty).
+            let model_path = stt_model
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| std::env::var("RHEMA_STT_MODEL").unwrap_or_default());
+            log::info!(
+                "[STT] provider=local, model={model_path}, streaming_override={stt_streaming:?}"
+            );
+            let engine = rhema_stt::LocalSttClient::new(model_path).with_streaming(stt_streaming);
             let local_active = conn_active.clone();
             let local_rx = deepgram_rx.clone();
             tauri::async_runtime::spawn(async move {
@@ -857,6 +948,23 @@ mod tests {
         let mut results = vec![auto_queued_detection()];
         gate_low_confidence(&mut results, PROJECT_CONF);
         assert!(results[0].auto_queued, "threshold is inclusive-pass");
+    }
+
+    #[cfg(feature = "local-stt")]
+    #[test]
+    fn stt_model_label_derives_family_quant_mode() {
+        assert_eq!(
+            stt_model_label("nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf", true),
+            "Nemotron · Q8 · streaming"
+        );
+        assert_eq!(
+            stt_model_label("parakeet-unified-en-0.6b-Q8_0.gguf", false),
+            "Parakeet · Q8 · offline"
+        );
+        assert_eq!(
+            stt_model_label("cohere-transcribe-03-2026-Q5_K_M.gguf", false),
+            "Cohere · Q5 · offline"
+        );
     }
 }
 

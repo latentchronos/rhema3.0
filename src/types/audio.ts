@@ -18,3 +18,10 @@ export interface AudioConfig {
   channel_index: number | null
   vad_enabled: boolean
 }
+
+/** An on-device STT model offered in Settings (from the `list_stt_models` command). */
+export interface SttModelInfo {
+  path: string
+  label: string
+  streaming: boolean
+}

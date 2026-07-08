@@ -1,5 +1,15 @@
 import { create } from "zustand"
 
+// Tiny localStorage helpers (guarded so the store also works under node/vitest). The STT
+// model choice persists across restarts like the theme + audio device do.
+const readLS = (k: string): string | null =>
+  typeof localStorage !== "undefined" ? localStorage.getItem(k) : null
+const writeLS = (k: string, v: string | null) => {
+  if (typeof localStorage === "undefined") return
+  if (v === null) localStorage.removeItem(k)
+  else localStorage.setItem(k, v)
+}
+
 interface SettingsState {
   deepgramApiKey: string | null
   openaiApiKey: string | null
@@ -14,6 +24,10 @@ interface SettingsState {
   audioDeviceId: string | null
   audioChannelIndex: number | null
   gain: number
+  /** Selected on-device STT model (absolute .gguf path); null = use backend default. */
+  sttModel: string | null
+  /** Whether the selected model is a streaming model; null = defer to the backend. */
+  sttStreaming: boolean | null
   vadEnabled: boolean
   commandWakeWord: string | null
   autoMode: boolean
@@ -32,6 +46,8 @@ interface SettingsState {
   setAudioDeviceId: (id: string | null) => void
   setAudioChannelIndex: (id: number | null) => void
   setGain: (gain: number) => void
+  /** Persisted; pass both so the picker sets model + streaming mode together. */
+  setSttModel: (model: string | null, streaming: boolean | null) => void
   setVadEnabled: (enabled: boolean) => void
   setCommandWakeWord: (word: string | null) => void
   setAutoMode: (auto: boolean) => void
@@ -52,6 +68,11 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   audioDeviceId: null,
   audioChannelIndex: null,
   gain: 1.0,
+  sttModel: readLS("rhema.sttModel"),
+  sttStreaming: (() => {
+    const v = readLS("rhema.sttStreaming")
+    return v === null ? null : v === "true"
+  })(),
   vadEnabled: false,
   commandWakeWord: null,
   autoMode: false,
@@ -70,6 +91,11 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   setAudioDeviceId: (audioDeviceId) => set({ audioDeviceId }),
   setAudioChannelIndex: (audioChannelIndex) => set({ audioChannelIndex }),
   setGain: (gain) => set({ gain }),
+  setSttModel: (sttModel, sttStreaming) => {
+    writeLS("rhema.sttModel", sttModel)
+    writeLS("rhema.sttStreaming", sttStreaming === null ? null : String(sttStreaming))
+    set({ sttModel, sttStreaming })
+  },
   setVadEnabled: (vadEnabled) => set({ vadEnabled }),
   setCommandWakeWord: (commandWakeWord) => set({ commandWakeWord }),
   setAutoMode: (autoMode) => set({ autoMode }),

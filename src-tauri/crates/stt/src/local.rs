@@ -112,6 +112,9 @@ const CONF_REFRESH: Duration = Duration::from_secs(2);
 /// On-device STT engine backed by a local GGUF model file.
 pub struct LocalSttClient {
     model_path: String,
+    /// Explicit streaming override (from the UI model picker); `None` falls back to the
+    /// `RHEMA_STT_STREAM` env var, preserving the previous behaviour.
+    streaming: Option<bool>,
 }
 
 impl LocalSttClient {
@@ -119,7 +122,16 @@ impl LocalSttClient {
     pub fn new(model_path: impl Into<String>) -> Self {
         Self {
             model_path: model_path.into(),
+            streaming: None,
         }
+    }
+
+    /// Force streaming on/off instead of reading `RHEMA_STT_STREAM`. `None` keeps the env
+    /// fallback (so a streaming model runs streaming and an offline one runs offline when
+    /// the UI selects it, without the operator also touching env vars).
+    pub fn with_streaming(mut self, streaming: Option<bool>) -> Self {
+        self.streaming = streaming;
+        self
     }
 }
 
@@ -131,7 +143,9 @@ impl SttEngine for LocalSttClient {
         event_tx: mpsc::Sender<TranscriptEvent>,
         keep_running: Arc<AtomicBool>,
     ) -> Result<(), SttError> {
-        let streaming = std::env::var("RHEMA_STT_STREAM").as_deref() == Ok("1");
+        let streaming = self
+            .streaming
+            .unwrap_or_else(|| std::env::var("RHEMA_STT_STREAM").as_deref() == Ok("1"));
         // When RHEMA_STT_MODEL is unset, fall back to the config we settled on for this
         // hardware: streaming → nemotron Q8 (best on-device accuracy; still keeps real-time
         // pace at att_right=13 on an i5-8265U), offline → parakeet Q8 (accurate,

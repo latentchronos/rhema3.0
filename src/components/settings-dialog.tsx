@@ -40,7 +40,7 @@ import {
   SparklesIcon,
 } from "lucide-react"
 import { useSettingsStore } from "@/stores"
-import type { DeviceInfo } from "@/types/audio"
+import type { DeviceInfo, SttModelInfo } from "@/types/audio"
 
 /* -------------------------------------------------------------------------- */
 /*  Nav definition                                                            */
@@ -92,10 +92,20 @@ function AudioSection() {
     setVadEnabled,
     commandWakeWord,
     setCommandWakeWord,
+    sttModel,
+    setSttModel,
   } = useSettingsStore()
 
   const [devices, setDevices] = useState<DeviceInfo[]>([])
   const [loading, setLoading] = useState(true)
+  const [sttModels, setSttModels] = useState<SttModelInfo[]>([])
+
+  // On-device model list (empty on a cloud-only build → the dropdown hides).
+  useEffect(() => {
+    invoke<SttModelInfo[]>("list_stt_models")
+      .then(setSttModels)
+      .catch(() => setSttModels([]))
+  }, [])
 
   const loadDevices = useCallback(async () => {
     try {
@@ -156,6 +166,42 @@ function AudioSection() {
           follow OS audio routing.
         </p>
       </div>
+
+      {sttModels.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Transcription Model
+          </label>
+          <Select
+            value={sttModel ?? "__default__"}
+            onValueChange={(v) => {
+              if (v === "__default__") {
+                setSttModel(null, null)
+              } else {
+                const m = sttModels.find((x) => x.path === v)
+                setSttModel(v, m ? m.streaming : null)
+              }
+            }}
+          >
+            <SelectTrigger className="h-8 text-xs">
+              <SelectValue placeholder="Default" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__default__">Default (Nemotron Q8 · streaming)</SelectItem>
+              {sttModels.map((m) => (
+                <SelectItem key={m.path} value={m.path}>
+                  {m.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-[0.625rem] text-muted-foreground">
+            On-device model; persists across sessions and applies on the next Start.
+            Streaming models (Nemotron) give a live line; offline models (Parakeet/Cohere)
+            transcribe per phrase.
+          </p>
+        </div>
+      )}
 
       {channelCount > 1 && (
         <div className="flex flex-col gap-2">
