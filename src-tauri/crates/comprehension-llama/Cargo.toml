@@ -14,6 +14,9 @@ encoding_rs = { version = "0.8", optional = true }
 default = []
 llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
 
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+
 [[example]]
 name = "spike"
 required-features = ["llama"]
