@@ -4,12 +4,14 @@
 //! trait; time is always injected (`now_ms: u64`) so the logic is deterministic.
 
 pub mod model;
+pub mod observer;
 pub mod schema;
 pub mod summary;
 pub mod types;
 pub mod window;
 
 pub use model::{Capabilities, ComprehensionModel, ModelError, ModelHealth, MockModel};
+pub use observer::{Observer, ObserverConfig};
 pub use schema::{parse_decision, Decision, OutputSchema, SchemaError};
 pub use summary::{MicroRecord, RollingSummary};
 pub use types::{
