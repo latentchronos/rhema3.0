@@ -6,9 +6,11 @@
 pub mod model;
 pub mod schema;
 pub mod types;
+pub mod window;
 
 pub use model::{Capabilities, ComprehensionModel, ModelError, ModelHealth, MockModel};
 pub use schema::{parse_decision, Decision, OutputSchema, SchemaError};
 pub use types::{
     ComprehensionState, DominantIntent, PassageRef, StateTransition, SupportingActivity,
 };
+pub use window::TranscriptWindow;
