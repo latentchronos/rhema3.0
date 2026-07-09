@@ -3,9 +3,11 @@
 //! All model communication goes through the [`ComprehensionModel`] adapter
 //! trait; time is always injected (`now_ms: u64`) so the logic is deterministic.
 
+pub mod model;
 pub mod schema;
 pub mod types;
 
+pub use model::{Capabilities, ComprehensionModel, ModelError, ModelHealth, MockModel};
 pub use schema::{parse_decision, Decision, OutputSchema, SchemaError};
 pub use types::{
     ComprehensionState, DominantIntent, PassageRef, StateTransition, SupportingActivity,
