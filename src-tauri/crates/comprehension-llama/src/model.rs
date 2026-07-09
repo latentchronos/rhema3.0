@@ -101,6 +101,32 @@ impl LlamaComprehensionModel {
         )
     }
 
+    /// Config-driven load from the environment. Reads the GGUF path from
+    /// `RHEMA_COMPREHENSION_MODEL` (absolute path), with optional overrides
+    /// `RHEMA_COMPREHENSION_NCTX` / `RHEMA_COMPREHENSION_THREADS`. Returns
+    /// `Ok(None)` when the path var is unset (comprehension simply disabled).
+    /// Phase I feeds the same values from user settings instead.
+    pub fn from_env() -> Result<Option<Self>, ModelError> {
+        let path = match std::env::var("RHEMA_COMPREHENSION_MODEL") {
+            Ok(p) if !p.trim().is_empty() => p,
+            _ => return Ok(None),
+        };
+        let mut cfg = LlamaConfig::default();
+        if let Some(v) = std::env::var("RHEMA_COMPREHENSION_NCTX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            cfg.n_ctx = v;
+        }
+        if let Some(v) = std::env::var("RHEMA_COMPREHENSION_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            cfg.n_threads = v;
+        }
+        Self::load(Path::new(&path), cfg).map(Some)
+    }
+
     /// Free (unconstrained) completion — used for generic prompts and testing.
     pub fn complete(&self, system: &str, user: &str) -> Result<String, ModelError> {
         self.generate(system, user, None)

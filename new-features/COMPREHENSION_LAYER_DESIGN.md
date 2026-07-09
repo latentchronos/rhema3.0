@@ -534,6 +534,48 @@ spec):
 
 ---
 
+# Appendix C — Phase B build recipe & measured results (2026-07-09)
+
+Phase B (local llama.cpp backend) is implemented in `crates/comprehension-llama`
+(`rhema-comprehension-llama`), `llama-cpp-2` v0.1.151 behind an optional `llama` feature. The default
+build compiles **no** native code; the app opts in via `--features local-comprehension`.
+
+**Build recipe on this machine (i5-8265U).** `clang` the driver is absent but `libclang` is present,
+so bindgen needs to be pointed at gcc's freestanding headers:
+
+```
+LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu \
+BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/15/include \
+  cargo build --features local-comprehension            # app
+# or, to run the backend smoke tests directly:
+  RHEMA_COMPREHENSION_MODEL=/abs/path/model/Qwen3-1.7B-Q4_K_M.gguf \
+  cargo test -p rhema-comprehension-llama --features llama --release
+```
+
+Model: `model/Qwen3-1.7B-Q4_K_M.gguf` (~1.1 GB, `unsloth/Qwen3-1.7B-GGUF`; gitignored like the STT
+GGUFs). Config-driven: `RHEMA_COMPREHENSION_MODEL` (+ optional `_NCTX`/`_THREADS`); Phase I feeds the
+same from settings. Switching 1.7B ↔ 4B ↔ any GGUF is a path/config change — no code change.
+
+**Measured on the target (Qwen3-1.7B Q4_K_M, CPU, 4 threads):**
+- Builds and runs. Peak RSS **~1.87 GB** (fits 7 GB alongside STT + app; confirms 4B was the wrong
+  default here).
+- ~**5 tok/s** greedy under heavy dev-tool contention (worst case). With the grammar the reply is a
+  short JSON object (~tens of tokens), so a real observer call is well inside the ~60 s cadence.
+- Chat template (Qwen3 ChatML + `/no_think`) makes it follow instructions; the **GBNF grammar**
+  (`json_schema_to_grammar`) makes a valid `Decision` a guarantee (intent/activities enum-constrained).
+
+**llama-cpp-2 gotchas learned (also in progress memory):**
+- `LlamaSampler::sample()` **already calls `accept` internally** — a second manual `accept` overshoots
+  a stateful grammar sampler and aborts (`GGML_ASSERT(!stacks.empty())`). Do not double-accept.
+- Prefer `json_schema_to_grammar` over hand-rolled GBNF (merged tokens overshoot hand rules).
+- `LlamaModel` is at `llama_cpp_2::model::LlamaModel`; sample the last-logits index (`n_tokens()-1`).
+
+**Not yet done (Phase I):** wiring the observer loop to this backend, the settings UI, and emitting
+state to the frontend. Grammar guarantees *shape*, not grounding accuracy — passages are improved
+later by retrieval/fusion, not the grammar.
+
+---
+
 # Appendix A — Comprehension Layer: Full Architecture (Merged)
 
 *Reproduced in full (source-of-truth architecture). This merges the original Comprehension Layer

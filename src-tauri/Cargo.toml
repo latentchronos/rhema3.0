@@ -56,6 +56,10 @@ rhema-stt = { path = "crates/stt" }
 rhema-broadcast = { path = "crates/broadcast" }
 rhema-detection = { path = "crates/detection", features = ["onnx", "vector-search"] }
 rhema-api = { path = "crates/api" }
+rhema-comprehension = { path = "crates/comprehension" }
+# Local comprehension backend. Default features pull NO native code; the
+# `local-comprehension` app feature turns on its `llama` feature (llama.cpp).
+rhema-comprehension-llama = { path = "crates/comprehension-llama" }
 crossbeam-channel = "0.5"
 dotenvy = "0.15"
 base64 = "0.22"
@@ -65,6 +69,14 @@ base64 = "0.22"
 # STT provider. Off by default: the standard build stays cloud-only (Deepgram) and
 # pulls in no native ggml/BLAS dependency. Build with: cargo build --features local-stt
 local-stt = ["rhema-stt/local-stt"]
+
+# On-device comprehension LLM (Qwen3-1.7B via llama.cpp / rhema-comprehension-llama).
+# Off by default: the standard build pulls no llama.cpp. Building it needs a
+# libclang + gcc headers on this machine (see README / design-doc build gotchas):
+#   LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu \
+#   BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/15/include \
+#   cargo build --features local-comprehension
+local-comprehension = ["rhema-comprehension-llama/llama"]
 
 # Neural speech-activity indicator (Silero VAD via ONNX Runtime) in place of the energy
 # VAD. Off by default so the standard build pulls no ONNX runtime for VAD; the on-device
