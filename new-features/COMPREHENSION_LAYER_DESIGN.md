@@ -74,26 +74,36 @@ tree. **The fastest way to get this wrong is to rebuild what is already there.**
 
 These were discussed and approved before writing this doc.
 
-### D1. Architecture-first, local model last
+### D1. Engine-first (model-free), then local Qwen directly — with an early build-spike
 
-Build the Observer, state machine, storage, and fusion **against the existing cloud adapter first**,
-prove the whole loop end-to-end, then **swap in the local llama.cpp backend as a configuration
-change** — which is exactly what §16's adapter pattern exists for. This de-risks the design before
-fighting CPU inference on the i5.
+*(Decision refined 2026-07-09: build directly on the local Qwen model; the cloud path is dropped from
+the critical path.)*
 
-**The one discipline this imposes:** a frontier cloud model will make the architecture *look* correct
-even if the design secretly depends on the model being smart. A Qwen3-4B at 4-bit is a much blunter
-instrument. So **every prompt, schema, and memory budget is designed for the 4B local model from day
-one** (short fixed prompts, strict schema, single-delta rolling summary, grammar-shaped output) — we
-only *run* it on cloud during development. Cloud is the engine; the 4B is the design constraint.
+Build the Observer, state machine, storage, and fusion as **model-free logic validated against a
+scripted mock model** (no network, no llama.cpp) — that is Spec #1 and it needs **no real backend at
+all**. Then wire the **local Qwen (llama.cpp) backend directly**. The cloud client is **not** on the
+critical path: the two-trait design still supports a cloud `ComprehensionModel` if ever wanted, but
+the shipped product is local-only per §18, so we build what we ship.
+
+**De-risk the scary part early.** The single highest-risk task is getting `llama.cpp` to build/link
+and run Qwen on the i5 (the same class of native-build friction already hit with `local-stt` + BLAS
+linking). So **before** committing to it, do a throwaway **build-spike (B0)**: confirm llama.cpp
+compiles on the target, loads Qwen3-4B Q4_K_M, and answers one prompt inside the latency budget. Run
+it **in parallel with the engine work (Phase C)** so it never blocks Spec #1 and the native-build risk
+is retired first.
+
+**The discipline this keeps:** because we build directly on the 4B, we feel its real limits from day
+one — so **every prompt, schema, and memory budget is sized for the 4B** (short fixed prompts, strict
+schema, single-delta rolling summary, grammar-shaped output). No smart cloud model can mask a design
+that is too demanding for what actually ships.
 
 ### D2. A new, model-free `rhema-comprehension` crate
 
 All comprehension intelligence lives in a new crate that is **DB-free and model-free**, exactly
 mirroring how `rhema-detection` is testable without a network or a model. It owns: the state machine,
 the observer scheduler, the incremental-prompt builder, the rolling summary, the fusion math, and the
-`ComprehensionModel` **adapter trait**. Every *concrete* backend (cloud today, llama.cpp later) lives
-**outside** it. This preserves the single most valuable property the detection crate already has:
+`ComprehensionModel` **adapter trait**. Every *concrete* backend (the local llama.cpp adapter; an
+optional cloud one) lives **outside** it. This preserves the single most valuable property the detection crate already has:
 the intelligence is fully unit-testable against a **mock model**.
 
 ### D3. Two traits, not one
@@ -137,8 +147,8 @@ does not hardcode this.
 The local backend (§18) enforces the §8 schema with llama.cpp's native **GBNF grammar** generated
 from our JSON schema (Appendix B §3 / Local-inference brief). This turns "ground it in a passage"
 into a **grammar-enforced** `Book Chapter:Verse` shape and constrains the intent field to our exact
-enum — a guarantee, not a hope. The cloud adapter keeps the existing tolerant JSON extraction as its
-enforcement path.
+enum — a guarantee, not a hope. Any non-grammar backend (the `MockModel`, or an optional cloud
+adapter) instead relies on the tolerant JSON extraction in `schema.rs`.
 
 ---
 
@@ -180,19 +190,25 @@ pre-production), `candle` as a runtime (low-level; trails llama.cpp on CPU), `ru
 ## 5. Sub-project decomposition & build order
 
 This document is ~6 sub-systems. They are decomposed into independently shippable pieces. The key
-unlock (D1): **C, D, E, F are all built and validated against the existing cloud adapter first**, so
-the observer architecture is proven before sub-project B (local inference) lands.
+unlock (D1): **the engine (C) is built and fully validated against a scripted mock model** — no real
+backend — so the observer architecture is proven independently of any model. The local backend (B) is
+then wired directly, with its highest-risk part retired early via the **B0 build-spike (run in
+parallel with C)**.
 
 | # | Sub-project | Spec | Depends on | Risk |
 |---|---|---|---|---|
 | **A** | Comprehension adapter trait (§16) — folded into C | #1 | — | low |
 | **C** | Observer engine + state machine (§5–§8), model-free crate, mock-validated | #1 | A | medium |
-| **W** | Cloud wiring — run the engine against the real cloud model | #2 | C | low |
-| **D** | Comprehension storage (§13/§17/§19) | #3 | C | medium |
-| **E** | Evidence fusion (§11) into the confidence path | #4 | C, detection | medium (correctness) |
-| **B** | Local LLM backend (§18) — llama.cpp/Qwen, CPU-first | #5 | A | **high** |
+| **B** | Local LLM backend (§18) — llama.cpp/Qwen, CPU-first; **early build-spike B0** | #2 | A | **high** |
+| **I** | App integration — wire the Observer in, settings, emit state to UI (backend-agnostic) | #3 | C, B | low |
+| **D** | Comprehension storage (§13/§17/§19) | #4 | C | medium |
+| **E** | Evidence fusion (§11) into the confidence path | #5 | C, B, detection | medium (correctness) |
 | **F** | Comprehension UI (§13) — timeline + detection join | #6 | D | low |
 | **G** | Local adaptation (§14B) | #7 | D, E | low, later |
+
+The old "cloud wiring" phase is dropped from the critical path — a cloud adapter stays an optional
+extra the trait supports, not a required step. Do the **B0 build-spike as early as possible, in
+parallel with Phase C**, so the native-build risk is retired before it can block anything.
 
 ---
 
@@ -249,8 +265,8 @@ pub struct StateTransition {                   // recorded only on a genuine cha
 }
 ```
 
-`schema.rs` owns the `OutputSchema` description (used by the cloud adapter's prompt and, later, by the
-GBNF generator) and a **tolerant** parser mirroring the existing `parse_stage2_json` (extract the
+`schema.rs` owns the `OutputSchema` description (used to build the observer prompt and, for the local
+backend, to generate the GBNF grammar) and a **tolerant** parser mirroring the existing `parse_stage2_json` (extract the
 outermost `{…}`, tolerate prose/fences). Zero passages is a valid parse (§9), never an error.
 
 ### 6.3 The adapter trait (`model.rs`) — §16 + D3/D6
@@ -372,22 +388,44 @@ approval). Bullets are sized to be individually reviewable, matching the Phase-1
 - **C7 — End-to-end engine test.** Scripted `MockModel` drives a simulated sermon → asserted state
   timeline. No network, no model. Closes Spec #1.
 
-### Phase W — Cloud wiring (Spec #2) · prove the loop against a real model
+### Phase B — Local LLM backend (Spec #2) · §18 · **the risky part — spike it EARLY**
 
-- **W1 — `CloudComprehensionModel` adapter.** Implement `ComprehensionModel` over the existing
-  `api/src/llm` plumbing (reuse `LlmConfig`/providers), with the comprehension prompt + `OutputSchema`
-  and a fixed cloud `Capabilities`. Lives **outside** the comprehension crate (in `rhema-api` or the
-  app). Tests: prompt shape, capability values (network paths integration-only, like existing
-  providers).
-- **W2 — Wire the Observer into the app.** New `commands/comprehension.rs` + a background task
+Do **B0 in parallel with Phase C** so the native-build risk is retired before it can block anything.
+
+- **B0 — Build-spike (throwaway).** Confirm `llama-cpp-2`/`llama.cpp` **compiles and links on the
+  i5** (expect the `local-stt`/BLAS class of friction), **loads Qwen3-4B Q4_K_M**, and answers one
+  hard-coded prompt **inside the latency budget** (`llama-bench` + a one-shot infer). Not wired to
+  anything — a go/no-go on the hard part. Deliverable: a documented tok/s number + the exact build
+  incantation for this machine. (If it fights us badly, fall back to the 1.7B or reconsider the
+  Ollama-sidecar shape — decision recorded here.)
+- **B1 — `llama-cpp-2` adapter behind `ComprehensionModel`.** New adapter crate/module;
+  feature-flagged (like `local-stt`); bundle a pinned GGUF; `clang` in the build. Load once at
+  startup (like Whisper). Tests: load + one infer on a tiny model (integration, feature-gated).
+- **B2 — GBNF grammar from `OutputSchema` (D7).** Generate a grammar constraining the intent enum +
+  passage `Book Chapter:Verse` pattern; attach as the sampler. Tests: grammar rejects off-enum
+  output; passage shape enforced.
+- **B3 — Capability reporting + health (D6).** Report `max_context_tokens`, structured-output = true;
+  `health()` reflects load state. Verify the engine sizes Σ to the reported context.
+- **B4 — Benchmark + model picker.** Firm up B0's numbers; decide 4B vs 1.7B default; runtime model
+  picker mirroring the existing STT model dropdown. Document tok/s on the real machine.
+
+*(A cloud `ComprehensionModel` adapter is intentionally NOT on the critical path. The two-trait design
+supports one if ever wanted — reuse `api/src/llm` — but the shipped product is local-only per §18.)*
+
+### Phase I — App integration (Spec #3) · backend-agnostic
+
+Wire the (now real, local) observer into the running app. Needs Phase C **and** Phase B.
+
+- **I1 — Wire the Observer into the app.** New `commands/comprehension.rs` + a background task
   (analogous to `run_stage2_worker`) fed by **final** transcript segments; managed `Mutex<Observer>`;
-  interval from settings; gated by `session_active` (reuse the Phase-5 gate). Emits transitions.
-- **W3 — Settings UI.** Comprehension **enable** toggle + **refresh interval** picker (10/15/20/30/
-  45/60 s, default conservative per §15) + reuse the existing LLM provider/key. `tsc`/`vitest` clean.
-- **W4 — Emit state to frontend.** Route comprehension transitions through the existing broadcast/
+  interval from settings; gated by `session_active` (reuse the Phase-5 gate). Emits transitions. Runs
+  against whatever `ComprehensionModel` is loaded (local Qwen today).
+- **I2 — Settings UI.** Comprehension **enable** toggle + **refresh interval** picker (10/15/20/30/
+  45/60 s, default conservative per §15) + the local model picker (from B4). `tsc`/`vitest` clean.
+- **I3 — Emit state to frontend.** Route comprehension transitions through the existing broadcast/
   channel layer; a minimal read-only timeline for dev validation (full UI is Phase F).
 
-### Phase D — Comprehension storage (Spec #3) · §13/§17/§19
+### Phase D — Comprehension storage (Spec #4) · §13/§17/§19
 
 - **D1 — Storage module + backend toggle (§19).** SQLite via `rusqlite`; **one schema, two
   backends** — session-only (`:memory:`) vs persistent (file), chosen at startup from a small
@@ -402,7 +440,7 @@ approval). Bullets are sized to be individually reviewable, matching the Phase-1
 - **D4 — At-rest encryption (optional, §19).** Encrypt the persistent DB file (church-sensitive
   content). Feature-gated; session-only mode unaffected.
 
-### Phase E — Evidence fusion (Spec #4) · §11 (correctness-sensitive)
+### Phase E — Evidence fusion (Spec #5) · §11 (correctness-sensitive)
 
 - **E1 — `fusion.rs` pure math (§11).** `EvidenceFusion` combines base detection confidence +
   comprehension agreement + retrieval + current state + local adaptation → adjusted confidence.
@@ -415,20 +453,8 @@ approval). Bullets are sized to be individually reviewable, matching the Phase-1
   → comprehension `Storytelling`+Luke 15 → fused confidence crosses threshold → projection via
   detection. Integration test with recorded/synthetic input.
 
-### Phase B — Local LLM backend (Spec #5) · §18 (the risky one, LAST)
-
-- **B1 — `llama-cpp-2` integration behind `ComprehensionModel`.** New adapter crate/module;
-  feature-flagged (like `local-stt`); bundle a pinned GGUF; `clang` in the build. Load once at
-  startup (like Whisper). Tests: load + one infer on a tiny model (integration, feature-gated).
-- **B2 — GBNF grammar from `OutputSchema` (D7).** Generate a grammar constraining the intent enum +
-  passage `Book Chapter:Verse` pattern; attach as the sampler. Tests: grammar rejects off-enum
-  output; passage shape enforced.
-- **B3 — Capability reporting + health (D6).** Report `max_context_tokens`, structured-output = true;
-  `health()` reflects load state. Verify the engine sizes Σ to the reported context.
-- **B4 — Benchmark + model picker.** `llama-bench` on the target; decide 4B vs 1.7B default; runtime
-  model picker mirroring the existing STT model dropdown. Document tok/s on the real machine.
-- **B5 — Config-based provider selection (§16).** Local vs cloud chosen in config — **the swap**.
-  Prove: flip config, the same Observer runs unchanged on the local model.
+*(Phase B — the local LLM backend — is documented above, immediately after Phase C, per the
+local-first sequencing. Run its **B0 spike early**, in parallel with Phase C.)*
 
 ### Phase F — Comprehension UI (Spec #6) · §13
 
@@ -484,8 +510,8 @@ spec):
 
 | Risk | Mitigation |
 |---|---|
-| **CPU inference too slow on the i5** (highest) | Architecture-first (D1) proves everything on cloud before B; once-a-minute cadence gives ~12 s headroom; 1.7B fallback; `llama-bench` before locking default (B4). |
-| **Design over-trusts a smart cloud model** | D1 discipline — design for the 4B from day one (short prompts, strict schema, single-delta summary). |
+| **CPU inference too slow on the i5** (highest) | Engine (C) proven against a `MockModel` before B; the **B0 spike** retires the build/latency risk early (parallel with C); once-a-minute cadence gives ~12 s headroom; 1.7B fallback; `llama-bench` before locking default (B4). |
+| **Design over-trusts the model** | D1 discipline — we build directly on the local 4B, so its real limits are felt from day one (short prompts, strict schema, single-delta summary); no cloud model masks them. |
 | **`llama-cpp-2` native build friction** (`clang`/link) | Same class as the existing `local-stt` BLAS gotcha; feature-gate it; document the build in the crate. |
 | **Comprehension hallucinates a state/passage** | Detection is the hallucination firewall (§17) — verse detections never depend on the LLM; worst case is a mislabeled context tag. `NO_CHANGE` + optional/nullable tags reduce fabrication surface. |
 | **State oscillation / thrash** | Σ/Δ verification-over-rediscovery (D4), `NO_CHANGE` bias, dominant-intent (not seconds-counted) selection (§6). |
@@ -497,12 +523,12 @@ spec):
 
 - **Spec #1 (C):** `rhema-comprehension` crate compiles, `cargo test --workspace` green / 0 warnings,
   the end-to-end mock-driven state-timeline test passes. No network, no model.
-- **Spec #2 (W):** a real cloud model drives the observer live; comprehension transitions appear in a
-  dev timeline; session-gated; interval configurable.
-- **Spec #3 (D):** both storage backends work; retention + join-at-display verified.
-- **Spec #4 (E):** the Prodigal Son scenario projects via fused confidence, through detection.
-- **Spec #5 (B):** flipping config runs the identical observer on the local Qwen model; grammar
-  guarantees valid JSON; benchmarked on the target.
+- **Spec #2 (B):** the **B0 spike** proved llama.cpp builds/runs Qwen on the i5 within budget; the
+  local `ComprehensionModel` adapter loads Qwen and returns grammar-valid JSON; benchmarked on target.
+- **Spec #3 (I):** the observer runs **live in the app on the local model**; transitions appear in a
+  dev timeline; session-gated; interval + model configurable in settings.
+- **Spec #4 (D):** both storage backends work; retention + join-at-display verified.
+- **Spec #5 (E):** the Prodigal Son scenario projects via fused confidence, through detection.
 - **Spec #6 (F):** timeline + detection-join UI.
 - **Spec #7 (G):** slow local adaptation feeds fusion.
 
