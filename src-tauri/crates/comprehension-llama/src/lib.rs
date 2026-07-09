@@ -3,6 +3,8 @@
 #![cfg_attr(not(feature = "llama"), allow(unused))]
 
 #[cfg(feature = "llama")]
+mod grammar;
+#[cfg(feature = "llama")]
 mod model;
 
 #[cfg(feature = "llama")]

@@ -41,11 +41,11 @@ fn infer_runs_end_to_end() {
     let schema = OutputSchema::default();
     let prompt = "CURRENT_UNDERSTANDING:\nnull\n\nSERMON_ARC:\n(nothing yet)\n\n\
                   NEW_TRANSCRIPT:\na certain man had two sons and the younger asked for his inheritance";
-    // Without the grammar (B2) the model may or may not emit valid JSON, so we
-    // only prove the end-to-end path runs; B2 makes the parse a guarantee.
+    // The GBNF grammar (B2) guarantees the output parses into a Decision.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let result = rt.block_on(model.infer(prompt, &schema));
     eprintln!("INFER RESULT: {result:?}");
+    assert!(result.is_ok(), "grammar must guarantee a parseable Decision: {result:?}");
 }

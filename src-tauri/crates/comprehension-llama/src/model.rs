@@ -22,6 +22,8 @@ use rhema_comprehension::{
     OutputSchema,
 };
 
+use crate::grammar;
+
 /// Runtime knobs for the local model. Model path is separate (see [`LlamaComprehensionModel::load`]).
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
@@ -52,6 +54,8 @@ pub struct LlamaComprehensionModel {
     model: LlamaModel,
     cfg: LlamaConfig,
     caps: Capabilities,
+    /// GBNF derived from the §8 `Decision` schema, built once at load.
+    gbnf: String,
 }
 
 impl LlamaComprehensionModel {
@@ -66,11 +70,14 @@ impl LlamaComprehensionModel {
             supports_structured_output: true,
             supports_streaming: false,
         };
+        let gbnf = llama_cpp_2::json_schema_to_grammar(grammar::DECISION_SCHEMA)
+            .map_err(|e| ModelError::Inference(format!("build grammar: {e}")))?;
         Ok(Self {
             backend,
             model,
             cfg,
             caps,
+            gbnf,
         })
     }
 
@@ -84,9 +91,20 @@ impl LlamaComprehensionModel {
         )
     }
 
-    /// Run one blocking generation over a system+user turn and return the raw
-    /// assistant text. This is the shared engine behind [`ComprehensionModel::infer`].
+    /// Free (unconstrained) completion — used for generic prompts and testing.
     pub fn complete(&self, system: &str, user: &str) -> Result<String, ModelError> {
+        self.generate(system, user, None)
+    }
+
+    /// Run one blocking generation over a system+user turn and return the raw
+    /// assistant text. `grammar` (GBNF) optionally constrains the output. This
+    /// is the shared engine behind [`ComprehensionModel::infer`].
+    fn generate(
+        &self,
+        system: &str,
+        user: &str,
+        grammar: Option<&str>,
+    ) -> Result<String, ModelError> {
         let prompt = Self::build_chatml(system, user);
 
         let ctx_params = LlamaContextParams::default()
@@ -118,7 +136,16 @@ impl LlamaComprehensionModel {
         ctx.decode(&mut batch)
             .map_err(|e| ModelError::Inference(format!("decode prompt: {e}")))?;
 
-        let mut sampler = LlamaSampler::greedy();
+        // Grammar sampler (if any) masks invalid tokens; greedy then picks the
+        // best allowed one. `sampler.accept` (below) advances the grammar state.
+        let mut sampler = match grammar {
+            Some(g) => {
+                let gr = LlamaSampler::grammar(&self.model, g, grammar::DECISION_ROOT)
+                    .map_err(|e| ModelError::Inference(format!("grammar: {e}")))?;
+                LlamaSampler::chain_simple([gr, LlamaSampler::greedy()])
+            }
+            None => LlamaSampler::greedy(),
+        };
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut out = String::new();
         let mut pos = n_prompt as i32;
@@ -126,8 +153,10 @@ impl LlamaComprehensionModel {
         // n_tokens-1); thereafter each single-token decode puts logits at 0.
         let mut sample_idx = batch.n_tokens() - 1;
         for _ in 0..self.cfg.max_gen_tokens {
+            // `sample` already calls `accept` internally (llama_sampler_sample),
+            // so we must NOT accept again — a double-accept overshoots a stateful
+            // grammar sampler and empties its stack.
             let next = sampler.sample(&ctx, sample_idx);
-            sampler.accept(next);
             if next == self.model.token_eos() {
                 break;
             }
@@ -137,6 +166,12 @@ impl LlamaComprehensionModel {
                     .token_to_piece(next, &mut decoder, false, None)
                     .map_err(|e| ModelError::Inference(format!("detokenize: {e}")))?,
             );
+            // With a grammar the object is guaranteed valid; stop as soon as it
+            // parses, so we never sample past completion (which empties the
+            // grammar stack and aborts llama.cpp).
+            if grammar.is_some() && parse_decision(&out).is_ok() {
+                break;
+            }
             batch.clear();
             batch
                 .add(next, pos, &[0], true)
@@ -163,7 +198,8 @@ impl ComprehensionModel for LlamaComprehensionModel {
         // `/no_think` is Qwen3's documented soft switch to skip its reasoning
         // mode — we want a terse, direct classification.
         let system = format!("{} /no_think", schema.instruction());
-        let raw = self.complete(&system, prompt)?;
+        // Grammar-constrained: the reply is guaranteed to be a valid Decision.
+        let raw = self.generate(&system, prompt, Some(&self.gbnf))?;
         parse_decision(&raw).map_err(|e| ModelError::Inference(format!("parse decision: {e}")))
     }
 }
