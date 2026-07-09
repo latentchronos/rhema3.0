@@ -48,6 +48,21 @@ impl Default for LlamaConfig {
     }
 }
 
+impl LlamaConfig {
+    /// The [`Capabilities`] a model loaded with this config reports (§16, D6).
+    /// Pure (no model needed): `max_context_tokens` drives the engine's §17
+    /// rolling-summary sizing. This backend always enforces structured output
+    /// (via the grammar) and does not stream.
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            name: self.name.clone(),
+            max_context_tokens: self.n_ctx as usize,
+            supports_structured_output: true,
+            supports_streaming: false,
+        }
+    }
+}
+
 /// A local llama.cpp-backed comprehension model. Load once, keep resident.
 pub struct LlamaComprehensionModel {
     backend: LlamaBackend,
@@ -64,12 +79,7 @@ impl LlamaComprehensionModel {
         let backend = LlamaBackend::init().map_err(|e| ModelError::Inference(e.to_string()))?;
         let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())
             .map_err(|e| ModelError::Inference(format!("load model: {e}")))?;
-        let caps = Capabilities {
-            name: cfg.name.clone(),
-            max_context_tokens: cfg.n_ctx as usize,
-            supports_structured_output: true,
-            supports_streaming: false,
-        };
+        let caps = cfg.capabilities();
         let gbnf = llama_cpp_2::json_schema_to_grammar(grammar::DECISION_SCHEMA)
             .map_err(|e| ModelError::Inference(format!("build grammar: {e}")))?;
         Ok(Self {
@@ -191,6 +201,11 @@ impl ComprehensionModel for LlamaComprehensionModel {
     }
 
     async fn health(&self) -> ModelHealth {
+        // An existing instance is, by construction, a loaded model (load is
+        // synchronous and fails with `Err` rather than yielding a half-ready
+        // instance). Async load-state tracking (Loading/Error before the model
+        // exists) is the app's concern in Phase I, which can wrap `load` in a
+        // background task and surface those states itself.
         ModelHealth::Ready
     }
 
@@ -201,5 +216,32 @@ impl ComprehensionModel for LlamaComprehensionModel {
         // Grammar-constrained: the reply is guaranteed to be a valid Decision.
         let raw = self.generate(&system, prompt, Some(&self.gbnf))?;
         parse_decision(&raw).map_err(|e| ModelError::Inference(format!("parse decision: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_capabilities_reflect_n_ctx() {
+        let cfg = LlamaConfig {
+            n_ctx: 1536,
+            n_threads: 2,
+            max_gen_tokens: 100,
+            name: "custom".to_string(),
+        };
+        let caps = cfg.capabilities();
+        assert_eq!(caps.max_context_tokens, 1536);
+        assert_eq!(caps.name, "custom");
+        assert!(caps.supports_structured_output);
+        assert!(!caps.supports_streaming);
+    }
+
+    #[test]
+    fn default_config_is_the_1_7b() {
+        let caps = LlamaConfig::default().capabilities();
+        assert_eq!(caps.name, "qwen3-1.7b-q4_k_m");
+        assert_eq!(caps.max_context_tokens, 2048);
     }
 }
