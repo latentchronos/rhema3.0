@@ -10,6 +10,7 @@ members = [
     "crates/broadcast",
     "crates/api",
     "crates/notes",
+    "crates/comprehension",
 ]
 resolver = "2"
 
