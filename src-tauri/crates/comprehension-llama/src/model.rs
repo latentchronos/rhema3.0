@@ -41,7 +41,11 @@ impl Default for LlamaConfig {
     fn default() -> Self {
         Self {
             n_ctx: 2048,
-            n_threads: 4,
+            // Deliberately HALF the 4 physical cores on the target i5-8265U so a
+            // comprehension inference can't pin every core and starve the realtime
+            // STT decode (the I6 lag fix). Override with RHEMA_COMPREHENSION_THREADS
+            // on hardware with more headroom.
+            n_threads: 2,
             max_gen_tokens: 160,
             name: "qwen3-1.7b-q4_k_m".to_string(),
         }
@@ -132,6 +136,23 @@ impl LlamaComprehensionModel {
         self.generate(system, user, None)
     }
 
+    /// Synchronous, CPU-blocking inference — the real work behind [`ComprehensionModel::infer`].
+    /// Exposed so the app can run it inside `tokio::task::spawn_blocking`: the
+    /// grammar-constrained `generate()` blocks its thread for seconds, which would
+    /// otherwise stall the async runtime (the I6 lag fix). Returns a guaranteed-valid
+    /// [`Decision`] (the grammar enforces the shape).
+    pub fn infer_blocking(
+        &self,
+        prompt: &str,
+        schema: &OutputSchema,
+    ) -> Result<Decision, ModelError> {
+        // `/no_think` is Qwen3's documented soft switch to skip its reasoning
+        // mode — we want a terse, direct classification.
+        let system = format!("{} /no_think", schema.instruction());
+        let raw = self.generate(&system, prompt, Some(&self.gbnf))?;
+        parse_decision(&raw).map_err(|e| ModelError::Inference(format!("parse decision: {e}")))
+    }
+
     /// Run one blocking generation over a system+user turn and return the raw
     /// assistant text. `grammar` (GBNF) optionally constrains the output. This
     /// is the shared engine behind [`ComprehensionModel::infer`].
@@ -143,9 +164,13 @@ impl LlamaComprehensionModel {
     ) -> Result<String, ModelError> {
         let prompt = Self::build_chatml(system, user);
 
+        // Cap BOTH generation and prompt-eval (batch) threads: the prompt-eval
+        // pass is the most CPU-intensive part, so leaving batch threads at the
+        // llama.cpp default would still saturate every core and starve STT.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(self.cfg.n_ctx))
-            .with_n_threads(self.cfg.n_threads);
+            .with_n_threads(self.cfg.n_threads)
+            .with_n_threads_batch(self.cfg.n_threads);
         let mut ctx = self
             .model
             .new_context(&self.backend, ctx_params)
@@ -236,12 +261,10 @@ impl ComprehensionModel for LlamaComprehensionModel {
     }
 
     async fn infer(&self, prompt: &str, schema: &OutputSchema) -> Result<Decision, ModelError> {
-        // `/no_think` is Qwen3's documented soft switch to skip its reasoning
-        // mode — we want a terse, direct classification.
-        let system = format!("{} /no_think", schema.instruction());
-        // Grammar-constrained: the reply is guaranteed to be a valid Decision.
-        let raw = self.generate(&system, prompt, Some(&self.gbnf))?;
-        parse_decision(&raw).map_err(|e| ModelError::Inference(format!("parse decision: {e}")))
+        // Delegates to the synchronous path. In the app this is instead called
+        // via `spawn_blocking` (see commands/comprehension.rs) so the CPU-heavy
+        // generation never stalls the async runtime.
+        self.infer_blocking(prompt, schema)
     }
 }
 
@@ -269,5 +292,13 @@ mod tests {
         let caps = LlamaConfig::default().capabilities();
         assert_eq!(caps.name, "qwen3-1.7b-q4_k_m");
         assert_eq!(caps.max_context_tokens, 2048);
+    }
+
+    #[test]
+    fn default_threads_leave_headroom_for_realtime_stt() {
+        // Half the 4 physical cores on the target: a comprehension inference must
+        // not pin every core and starve the STT decode (I6 lag fix). If this ever
+        // regresses to a higher default, revisit the CPU-contention analysis.
+        assert_eq!(LlamaConfig::default().n_threads, 2);
     }
 }

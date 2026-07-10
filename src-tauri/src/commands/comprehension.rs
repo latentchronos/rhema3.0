@@ -130,8 +130,9 @@ pub async fn run_comprehension_worker(
 
     // Load the local model once (feature-gated). Without the feature, or with no
     // model configured, there is no model and the worker just drains the channel.
+    // Wrapped in an Arc so each inference can be handed to a blocking thread.
     #[cfg(feature = "local-comprehension")]
-    let model = load_configured_model(&app);
+    let model = load_configured_model(&app).map(std::sync::Arc::new);
 
     // Shared session gate — same flag detection uses (§2.4).
     let session_active = {
@@ -194,15 +195,27 @@ pub async fn run_comprehension_worker(
             continue;
         }
 
-        // Inference happens OUTSIDE the lock (it can take seconds).
+        // Inference happens OUTSIDE the lock (it can take seconds) AND on a
+        // blocking thread (spawn_blocking) so it never stalls the async runtime.
+        // Combined with the capped thread count in LlamaConfig, this keeps the
+        // realtime STT decode from being starved during a comprehension call (I6
+        // lag fix).
         #[cfg(feature = "local-comprehension")]
         let decision = match &model {
             Some(m) => {
-                use rhema_comprehension::{ComprehensionModel, OutputSchema};
-                match m.infer(&prompt, &OutputSchema::default()).await {
-                    Ok(d) => Some(d),
-                    Err(e) => {
+                let m = std::sync::Arc::clone(m);
+                match tokio::task::spawn_blocking(move || {
+                    m.infer_blocking(&prompt, &rhema_comprehension::OutputSchema::default())
+                })
+                .await
+                {
+                    Ok(Ok(d)) => Some(d),
+                    Ok(Err(e)) => {
                         log::warn!("[comprehension] infer error: {e}");
+                        None
+                    }
+                    Err(e) => {
+                        log::warn!("[comprehension] infer task failed: {e}");
                         None
                     }
                 }
