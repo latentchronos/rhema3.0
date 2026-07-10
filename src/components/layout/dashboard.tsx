@@ -6,15 +6,19 @@ import { QueuePanel } from "@/components/panels/queue-panel"
 import { SearchPanel } from "@/components/panels/search-panel"
 import { DetectionsPanel } from "@/components/panels/detections-panel"
 import { SuggestionsPanel } from "@/components/panels/suggestions-panel"
+import { ComprehensionPanel } from "@/components/panels/comprehension-panel"
 import { Toaster } from "@/components/ui/toaster"
 import { useChannels } from "@/hooks/use-channels"
 import { useVoiceCommands } from "@/hooks/use-voice-commands"
+import { useComprehension } from "@/hooks/use-comprehension"
 
 export function Dashboard() {
   // Subscribe to the Phase 4 channel events and cache them in the broadcast store.
   useChannels()
   // Handle backend-emitted voice control commands (next/previous/clear).
   useVoiceCommands()
+  // Cache the local comprehension observer's state transitions (Phase I).
+  useComprehension()
 
   return (
     <div
@@ -57,6 +61,7 @@ export function Dashboard() {
           <div className="min-h-0 flex-1">
             <DetectionsPanel />
           </div>
+          <ComprehensionPanel />
           <SuggestionsPanel />
         </div>
       </div>
