@@ -32,6 +32,14 @@ pub fn run() {
         .manage(Mutex::new(channels::ChannelState::default()))
         .manage(Mutex::new(suggestion::SuggestionEngine::new()))
         .manage(Mutex::new(Option::<rhema_api::llm::LlmConfig>::None))
+        // Comprehension observer (Phase I). Model-free engine; the local Qwen
+        // backend is loaded by the worker under the `local-comprehension` feature.
+        // 60s window age (§3); 4 rolling-summary records (sized via settings in I4).
+        .manage(Mutex::new(rhema_comprehension::Observer::new(
+            rhema_comprehension::ObserverConfig::default(),
+            60_000,
+            4,
+        )))
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -101,6 +109,22 @@ pub fn run() {
                     let handle = app.handle().clone();
                     tauri::async_runtime::spawn(commands::stt::run_stage2_worker(handle, rx));
                 }
+            }
+
+            // Phase I: comprehension observer worker. A bounded feed channel
+            // carries coalesced final sentences from the STT worker (filled in
+            // Task I2); the sender is stashed in managed state. The worker is
+            // fed off-thread and never backpressures detection.
+            {
+                let (comp_tx, comp_rx) = tokio::sync::mpsc::channel::<String>(64);
+                app.manage(commands::comprehension::ComprehensionFeed(Mutex::new(Some(
+                    comp_tx,
+                ))));
+                let comp_handle = app.handle().clone();
+                tauri::async_runtime::spawn(commands::comprehension::run_comprehension_worker(
+                    comp_handle,
+                    comp_rx,
+                ));
             }
 
             // Phase 4 (Bullet 4.4): start the 2s device-health monitor. It

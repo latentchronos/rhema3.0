@@ -1,6 +1,9 @@
 pub const EVENT_AUDIO_LEVEL: &str = "audio_level";
 pub const EVENT_TRANSCRIPT_PARTIAL: &str = "transcript_partial";
 pub const EVENT_TRANSCRIPT_FINAL: &str = "transcript_final";
+/// A comprehension state transition (dominant intent changed). Payload is
+/// `rhema_comprehension::StateTransition`.
+pub const EVENT_COMPREHENSION_STATE: &str = "comprehension_state";
 
 #[derive(Clone, serde::Serialize)]
 pub struct AudioLevelPayload {

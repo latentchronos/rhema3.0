@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod bible;
 pub mod broadcast;
+pub mod comprehension;
 pub mod detection;
 pub mod llm;
 pub mod obs;
