@@ -12,8 +12,6 @@ use std::path::Path;
 #[cfg(feature = "onnx")]
 use crate::error::DetectionError;
 #[cfg(feature = "onnx")]
-use super::embedder::TextEmbedder;
-#[cfg(feature = "onnx")]
 use super::onnx_embedder::OnnxEmbedder;
 
 /// Pre-compute embeddings for a set of verses and write the results to
@@ -54,29 +52,47 @@ pub fn precompute_embeddings(
         DetectionError::Internal(format!("create {}: {e}", output_ids_path.display()))
     })?;
 
-    for (i, (verse_id, text)) in verses.iter().enumerate() {
-        let embedding = embedder.embed(text)?;
+    // Embed in batches to amortize per-call ONNX overhead (~10x fewer runs than
+    // one-verse-at-a-time). Each batch row is identical to a single `embed` (proven
+    // by the embedder's equivalence test), and rows are written in verse order, so
+    // the on-disk byte layout is unchanged. Tunable via RHEMA_PRECOMPUTE_BATCH.
+    let batch_size: usize = std::env::var("RHEMA_PRECOMPUTE_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(32);
+    log::info!("  (batch size {batch_size})");
 
-        // Write f32 vector as raw bytes (native byte order).
-        // Safety: f32 has no padding and a well-defined repr.
-        let emb_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                embedding.len() * std::mem::size_of::<f32>(),
-            )
-        };
-        emb_file.write_all(emb_bytes).map_err(|e| {
-            DetectionError::Internal(format!("write embedding: {e}"))
-        })?;
+    let mut done = 0usize;
+    for chunk in verses.chunks(batch_size) {
+        let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+        let embeddings = embedder.embed_batch(&texts)?;
 
-        // Write verse_id as raw i64 bytes (native byte order).
-        let id_bytes = verse_id.to_ne_bytes();
-        ids_file.write_all(&id_bytes).map_err(|e| {
-            DetectionError::Internal(format!("write id: {e}"))
-        })?;
+        for ((verse_id, _), embedding) in chunk.iter().zip(embeddings.iter()) {
+            // Write f32 vector as raw bytes (native byte order).
+            // Safety: f32 has no padding and a well-defined repr.
+            let emb_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    embedding.as_ptr() as *const u8,
+                    embedding.len() * std::mem::size_of::<f32>(),
+                )
+            };
+            emb_file.write_all(emb_bytes).map_err(|e| {
+                DetectionError::Internal(format!("write embedding: {e}"))
+            })?;
 
-        if (i + 1) % 1000 == 0 || i + 1 == total {
-            log::info!("  embedded {}/{} verses", i + 1, total);
+            // Write verse_id as raw i64 bytes (native byte order).
+            let id_bytes = verse_id.to_ne_bytes();
+            ids_file.write_all(&id_bytes).map_err(|e| {
+                DetectionError::Internal(format!("write id: {e}"))
+            })?;
+        }
+
+        let prev = done;
+        done += chunk.len();
+        // Log once per ~1000 verses crossed (and at the end).
+        if done == total || done / 1000 != prev / 1000 {
+            log::info!("  embedded {}/{} verses", done, total);
         }
     }
 
