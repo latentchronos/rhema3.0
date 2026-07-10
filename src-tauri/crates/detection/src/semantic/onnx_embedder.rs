@@ -43,6 +43,42 @@ pub struct OnnxEmbedder {
 #[cfg(feature = "onnx")]
 unsafe impl Sync for OnnxEmbedder {}
 
+/// L2-normalise a vector in place (no-op on a zero-norm vector).
+#[cfg(feature = "onnx")]
+fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Masked mean-pool one sequence's token hidden states. `hidden` is the
+/// `[seq_len, dim]` row-major slice for a single sequence; tokens with
+/// `mask[tok] == 0` (padding) are excluded. Shared by `embed_impl` and
+/// `embed_batch` so both produce identical vectors.
+#[cfg(feature = "onnx")]
+fn mean_pool(hidden: &[f32], mask: &[i64], seq_len: usize, dim: usize) -> Vec<f32> {
+    let mut pooled = vec![0.0f32; dim];
+    let mut mask_sum = 0.0f32;
+    for tok in 0..seq_len {
+        if mask[tok] > 0 {
+            let offset = tok * dim;
+            for d in 0..dim {
+                pooled[d] += hidden[offset + d];
+            }
+            mask_sum += 1.0;
+        }
+    }
+    if mask_sum > 0.0 {
+        for d in 0..dim {
+            pooled[d] /= mask_sum;
+        }
+    }
+    pooled
+}
+
 #[cfg(feature = "onnx")]
 impl OnnxEmbedder {
     /// Maximum number of tokens the model will accept.
@@ -246,7 +282,7 @@ impl OnnxEmbedder {
 
         let out_dims: &[i64] = &*out_shape;
 
-        let pooled = if out_dims.len() == 2 {
+        let mut result = if out_dims.len() == 2 {
             // sentence_embedding: shape [1, dim] — already pooled by sentence-transformers
             let dim = out_dims[1] as usize;
             data[..dim].to_vec()
@@ -257,23 +293,8 @@ impl OnnxEmbedder {
             // in a different vector space than the pre-computed verse embeddings.
             let seq_len = out_dims[1] as usize;
             let dim = out_dims[2] as usize;
-            let mut pooled = vec![0.0f32; dim];
-            let mut mask_sum = 0.0f32;
-            for tok in 0..seq_len {
-                if mask[tok] > 0 {
-                    let offset = tok * dim;
-                    for d in 0..dim {
-                        pooled[d] += data[offset + d];
-                    }
-                    mask_sum += 1.0;
-                }
-            }
-            if mask_sum > 0.0 {
-                for d in 0..dim {
-                    pooled[d] /= mask_sum;
-                }
-            }
-            pooled
+            let mask_i64: Vec<i64> = mask.iter().map(|&v| v as i64).collect();
+            mean_pool(&data, &mask_i64, seq_len, dim)
         } else {
             return Err(DetectionError::Internal(format!(
                 "unexpected tensor rank: {:?}",
@@ -282,13 +303,7 @@ impl OnnxEmbedder {
         };
 
         // L2 normalise (safe to re-normalize even if already normalized)
-        let mut result = pooled;
-        let norm: f32 = result.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in result.iter_mut() {
-                *v /= norm;
-            }
-        }
+        l2_normalize(&mut result);
 
         let elapsed = embed_start.elapsed();
         log::info!(
@@ -298,6 +313,171 @@ impl OnnxEmbedder {
         );
 
         Ok(result)
+    }
+
+    /// Embed many texts in a single ONNX run. Because the tokenizer pads every
+    /// sequence to a fixed length (`MAX_TOKENS`), each batch row is identical to
+    /// `embed_impl` of that text (same masked mean-pool + L2) — verified by the
+    /// `embed_batch_matches_single` equivalence test. Used by the offline verse
+    /// precompute to amortize per-call overhead across the batch (~10x fewer runs).
+    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, DetectionError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let prefixed: Vec<String> = texts
+            .iter()
+            .map(|t| format!("{}{}", self.prompt_prefix, t))
+            .collect();
+
+        let encodings = self
+            .tokenizer
+            .encode_batch(prefixed, true)
+            .map_err(|e| DetectionError::Internal(format!("tokenize batch: {e}")))?;
+
+        let batch = encodings.len();
+        // Fixed padding (MAX_TOKENS) → every row has the same length.
+        let seq_len = encodings[0].get_ids().len();
+
+        let mut input_ids_data: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        let mut attention_mask_data: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        let mut position_ids_data: Vec<i64> = Vec::with_capacity(batch * seq_len);
+        let mut masks: Vec<Vec<i64>> = Vec::with_capacity(batch);
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            if ids.len() != seq_len {
+                return Err(DetectionError::Internal(format!(
+                    "batch row length {} != {seq_len} (fixed padding expected)",
+                    ids.len()
+                )));
+            }
+            let mask_i64: Vec<i64> = enc.get_attention_mask().iter().map(|&v| v as i64).collect();
+            for &v in ids {
+                input_ids_data.push(v as i64);
+            }
+            attention_mask_data.extend_from_slice(&mask_i64);
+            for p in 0..seq_len as i64 {
+                position_ids_data.push(p);
+            }
+            masks.push(mask_i64);
+        }
+
+        let shape = vec![batch as i64, seq_len as i64];
+        let input_ids_tensor = Tensor::from_array((shape.clone(), input_ids_data))
+            .map_err(|e| DetectionError::Internal(format!("input_ids tensor: {e}")))?;
+        let attention_mask_tensor = Tensor::from_array((shape.clone(), attention_mask_data))
+            .map_err(|e| DetectionError::Internal(format!("attention_mask tensor: {e}")))?;
+        let position_ids_tensor = Tensor::from_array((shape, position_ids_data))
+            .map_err(|e| DetectionError::Internal(format!("position_ids tensor: {e}")))?;
+
+        let inputs = if self.has_position_ids {
+            ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "position_ids" => position_ids_tensor,
+            ]
+        } else {
+            ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            ]
+        };
+
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|e| DetectionError::Internal(format!("session lock: {e}")))?;
+        let outputs = session
+            .run(inputs)
+            .map_err(|e| DetectionError::Internal(format!("ort run: {e}")))?;
+
+        let output_value = if outputs.contains_key("sentence_embedding") {
+            &outputs["sentence_embedding"]
+        } else if outputs.contains_key("last_hidden_state") {
+            &outputs["last_hidden_state"]
+        } else {
+            &outputs[0usize]
+        };
+        let (out_shape, data) = output_value
+            .try_extract_tensor::<f32>()
+            .map_err(|e| DetectionError::Internal(format!("extract tensor: {e}")))?;
+        let out_dims: &[i64] = &*out_shape;
+
+        let mut results = Vec::with_capacity(batch);
+        if out_dims.len() == 2 {
+            // [batch, dim] — pre-pooled sentence embeddings.
+            let dim = out_dims[1] as usize;
+            for b in 0..batch {
+                let mut row = data[b * dim..(b + 1) * dim].to_vec();
+                l2_normalize(&mut row);
+                results.push(row);
+            }
+        } else if out_dims.len() == 3 {
+            // [batch, seq_len, dim] — masked mean pool per row (same as embed_impl).
+            let out_seq = out_dims[1] as usize;
+            let dim = out_dims[2] as usize;
+            let row_stride = out_seq * dim;
+            for b in 0..batch {
+                let hidden = &data[b * row_stride..(b + 1) * row_stride];
+                let mut pooled = mean_pool(hidden, &masks[b], out_seq, dim);
+                l2_normalize(&mut pooled);
+                results.push(pooled);
+            }
+        } else {
+            return Err(DetectionError::Internal(format!(
+                "unexpected tensor rank: {:?}",
+                out_dims
+            )));
+        }
+
+        Ok(results)
+    }
+}
+
+#[cfg(all(test, feature = "onnx"))]
+mod tests {
+    use super::OnnxEmbedder;
+    use std::path::Path;
+
+    /// Load the embedder from env-provided model/tokenizer paths, or `None` to skip.
+    fn load_from_env() -> Option<OnnxEmbedder> {
+        let model = std::env::var("RHEMA_ONNX_MODEL").ok()?;
+        let tokenizer = std::env::var("RHEMA_ONNX_TOKENIZER").ok()?;
+        OnnxEmbedder::load(Path::new(&model), Path::new(&tokenizer)).ok()
+    }
+
+    /// `embed_batch` must return vectors numerically identical to per-text `embed_impl`
+    /// — batching is a throughput optimization, it must not move any vector. Skips
+    /// silently unless RHEMA_ONNX_MODEL + RHEMA_ONNX_TOKENIZER point at a real model.
+    #[test]
+    fn embed_batch_matches_single() {
+        let Some(embedder) = load_from_env() else {
+            eprintln!(
+                "skipping embed_batch_matches_single: set RHEMA_ONNX_MODEL + RHEMA_ONNX_TOKENIZER"
+            );
+            return;
+        };
+        let texts = [
+            "For God so loved the world",
+            "In the beginning was the Word",
+            "The Lord is my shepherd, I shall not want",
+        ];
+        let singles: Vec<Vec<f32>> = texts
+            .iter()
+            .map(|t| embedder.embed_impl(t).expect("single embed"))
+            .collect();
+        let batched = embedder.embed_batch(&texts).expect("batch embed");
+
+        assert_eq!(batched.len(), texts.len());
+        for (i, (b, s)) in batched.iter().zip(singles.iter()).enumerate() {
+            assert_eq!(b.len(), s.len(), "row {i}: dim mismatch");
+            let max_diff = b
+                .iter()
+                .zip(s.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-4, "row {i}: max diff {max_diff} exceeds 1e-4");
+        }
     }
 }
 
