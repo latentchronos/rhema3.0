@@ -11,16 +11,11 @@ export default defineConfig({
     strictPort: true,
     watch: {
       // Don't watch heavy non-source trees. The Python `.venv` (torch/transformers/
-      // sympy from the semantic-embedding tooling) holds tens of thousands of files and
-      // blows past the inotify watcher limit (ENOSPC) if Vite tries to watch it.
-      ignored: [
-        "**/.venv/**",
-        "**/src-tauri/target/**",
-        "**/model/**",
-        "**/models/**",
-        "**/embeddings/**",
-        "**/.git/**",
-      ],
+      // sympy from the semantic-embedding tooling) holds ~38k files and blows past the
+      // inotify watcher limit (ENOSPC) if Vite tries to watch it. NOTE: Vite 7's watcher
+      // takes a predicate/regex here, NOT glob strings — a function is version-robust.
+      ignored: (p: string) =>
+        /[\\/](\.venv|\.git|node_modules|target|models?|embeddings)([\\/]|$)/.test(p),
     },
   },
   build: {
