@@ -89,6 +89,56 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot / (na.sqrt() * nb.sqrt())
 }
 
+/// Whether a due comprehension tick should run now, given STT load (STT-backlog gate).
+/// `allow(dead_code)`: wired into `run_comprehension_worker` in the next bullet (the gate
+/// consumer); until then only the unit tests exercise it.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunDecision {
+    /// STT is caught up (or the starvation valve fired) — run the inference tick.
+    Run,
+    /// STT is behind — defer this tick; it is re-offered on the next final sentence.
+    Skip,
+    /// Not due this tick — do nothing.
+    Idle,
+}
+
+/// Pure gate decision for a comprehension tick (I6 freeze fix). `due` is
+/// `Observer::should_evaluate`; `backlog` is the queued STT frame depth; `max` is the
+/// skip threshold (inclusive — `backlog <= max` runs); `deferred_since` is the timestamp
+/// of the first consecutive skip (`None` = not deferring); `force_ms` is the starvation
+/// valve ceiling. Returns `(decision, next_deferred_since)`.
+///
+/// A `Skip` loses nothing: `should_evaluate` is a pure query and `last_eval_ms` only
+/// advances in `apply_decision`, so the tick is re-checked against a fresh backlog
+/// reading on the next sentence and resumes the moment STT drains below `max`.
+#[allow(dead_code)] // consumed by run_comprehension_worker in the next bullet
+fn decide_run(
+    due: bool,
+    backlog: usize,
+    max: usize,
+    now_ms: u64,
+    deferred_since: Option<u64>,
+    force_ms: u64,
+) -> (RunDecision, Option<u64>) {
+    if !due {
+        return (RunDecision::Idle, None);
+    }
+    if backlog <= max {
+        return (RunDecision::Run, None);
+    }
+    match deferred_since {
+        None => (RunDecision::Skip, Some(now_ms)),
+        Some(since) => {
+            if now_ms.saturating_sub(since) >= force_ms {
+                (RunDecision::Run, None) // starvation valve: force a run, reset timer
+            } else {
+                (RunDecision::Skip, Some(since)) // keep deferring; preserve original timer
+            }
+        }
+    }
+}
+
 /// Load the local model once at worker startup: prefer the user's persisted
 /// choice (Settings, §I4), else fall back to `from_env()` (the
 /// `RHEMA_COMPREHENSION_MODEL` default). A persisted path uses `LlamaConfig`
@@ -337,7 +387,57 @@ pub fn list_comprehension_models() -> Vec<ComprehensionModelInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::cosine_distance;
+    use super::{cosine_distance, decide_run, RunDecision};
+
+    #[test]
+    fn not_due_is_idle_and_clears_timer() {
+        assert_eq!(
+            decide_run(false, 999, 256, 1000, Some(500), 180_000),
+            (RunDecision::Idle, None)
+        );
+    }
+
+    #[test]
+    fn due_and_caught_up_runs_and_clears_timer() {
+        assert_eq!(
+            decide_run(true, 24, 256, 1000, None, 180_000),
+            (RunDecision::Run, None)
+        );
+    }
+
+    #[test]
+    fn backlog_equal_to_max_runs_inclusive() {
+        assert_eq!(
+            decide_run(true, 256, 256, 1000, None, 180_000),
+            (RunDecision::Run, None)
+        );
+    }
+
+    #[test]
+    fn due_and_behind_first_time_skips_and_sets_timer() {
+        assert_eq!(
+            decide_run(true, 492, 256, 1000, None, 180_000),
+            (RunDecision::Skip, Some(1000))
+        );
+    }
+
+    #[test]
+    fn due_and_behind_within_ceiling_keeps_original_timer() {
+        // deferred at 1000, now 60_000, ceiling 180_000 -> still skipping, timer unchanged
+        assert_eq!(
+            decide_run(true, 492, 256, 60_000, Some(1000), 180_000),
+            (RunDecision::Skip, Some(1000))
+        );
+    }
+
+    #[test]
+    fn due_and_behind_past_ceiling_forces_run_and_clears_timer() {
+        // deferred at 1000, now 181_001, ceiling 180_000 -> valve fires
+        assert_eq!(
+            decide_run(true, 492, 256, 181_001, Some(1000), 180_000),
+            (RunDecision::Run, None)
+        );
+    }
 
     #[test]
     fn identical_vectors_have_zero_distance() {
