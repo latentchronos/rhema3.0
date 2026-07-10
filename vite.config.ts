@@ -9,6 +9,19 @@ export default defineConfig({
   server: {
     port: 3000,
     strictPort: true,
+    watch: {
+      // Don't watch heavy non-source trees. The Python `.venv` (torch/transformers/
+      // sympy from the semantic-embedding tooling) holds tens of thousands of files and
+      // blows past the inotify watcher limit (ENOSPC) if Vite tries to watch it.
+      ignored: [
+        "**/.venv/**",
+        "**/src-tauri/target/**",
+        "**/model/**",
+        "**/models/**",
+        "**/embeddings/**",
+        "**/.git/**",
+      ],
+    },
   },
   build: {
     outDir: "build",
