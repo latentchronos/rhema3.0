@@ -569,6 +569,16 @@ pub async fn start_transcription(
     let det_session = session_active.clone();
     // Clone the (already-normalised) wake word into the detection worker.
     let det_wake = wake_word.clone();
+    // Comprehension feed (Phase I): a cloned sender to the observer worker. Each
+    // coalesced sentence is `try_send`-tapped here in parallel with `semantic_tx`;
+    // `try_send` drops when the bounded channel is full so comprehension can never
+    // backpressure detection. `None` if the feed isn't managed yet (never, at runtime).
+    let comp_tx = app
+        .state::<crate::commands::comprehension::ComprehensionFeed>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
     tauri::async_runtime::spawn(async move {
         // Sentence buffer accumulates is_final fragments into complete sentences.
         // Flushes on sentence-ending punctuation or speech_final signal.
@@ -638,6 +648,9 @@ pub async fn start_transcription(
                                         rhema_detection::metrics::log_channel_drop("quotation");
                                     }
                                     if let Some(sentence) = sentence_buf.append(&transcript) {
+                                        if let Some(tx) = &comp_tx {
+                                            let _ = tx.try_send(sentence.clone());
+                                        }
                                         if semantic_tx.try_send(sentence).is_err() {
                                             rhema_detection::metrics::log_channel_drop("semantic");
                                         }
@@ -648,6 +661,9 @@ pub async fn start_transcription(
                             }
                             if speech_final {
                                 if let Some(sentence) = sentence_buf.force_flush() {
+                                    if let Some(tx) = &comp_tx {
+                                        let _ = tx.try_send(sentence.clone());
+                                    }
                                     if semantic_tx.try_send(sentence).is_err() {
                                         rhema_detection::metrics::log_channel_drop("semantic");
                                     }
@@ -656,6 +672,9 @@ pub async fn start_transcription(
                         }
                         FinalJob::UtteranceEnd => {
                             if let Some(sentence) = sentence_buf.force_flush() {
+                                if let Some(tx) = &comp_tx {
+                                    let _ = tx.try_send(sentence.clone());
+                                }
                                 if semantic_tx.try_send(sentence).is_err() {
                                     rhema_detection::metrics::log_channel_drop("semantic");
                                 }
@@ -686,6 +705,9 @@ pub async fn start_transcription(
                         continue;
                     }
                     if let Some(sentence) = sentence_buf.check_timeout() {
+                        if let Some(tx) = &comp_tx {
+                            let _ = tx.try_send(sentence.clone());
+                        }
                         if semantic_tx.try_send(sentence).is_err() {
                             rhema_detection::metrics::log_channel_drop("semantic");
                         }

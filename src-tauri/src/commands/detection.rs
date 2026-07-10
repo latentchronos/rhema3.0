@@ -44,6 +44,7 @@ pub struct DetectionResult {
 pub fn start_session(
     state: State<'_, Mutex<AppState>>,
     suggestion: State<'_, Mutex<crate::suggestion::SuggestionEngine>>,
+    observer: State<'_, Mutex<rhema_comprehension::Observer>>,
 ) -> Result<(), String> {
     {
         let mut s = state.lock().map_err(|e| e.to_string())?;
@@ -54,6 +55,11 @@ pub fn start_session(
     }
     if let Ok(mut eng) = suggestion.lock() {
         eng.clear_session();
+    }
+    // Comprehension (Phase I): reset the observer's Σ/window/summary so the new
+    // service starts from IDLE with no carried-over discourse state.
+    if let Ok(mut obs) = observer.lock() {
+        obs.clear_session();
     }
     log::info!("session: started");
     Ok(())
