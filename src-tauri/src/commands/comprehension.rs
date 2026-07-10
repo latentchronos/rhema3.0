@@ -67,6 +67,28 @@ fn now_ms(base: std::time::Instant) -> u64 {
     base.elapsed().as_millis() as u64
 }
 
+/// Cosine *distance* (`1 - cosine_similarity`) between two topic vectors, in
+/// `[0, 2]`. Used to detect a sharp topic shift (I5). Guards defensively: a
+/// dimension mismatch or a zero-norm vector returns `0.0` (= no shift), so a
+/// degenerate reading never fires a spurious early evaluation.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    1.0 - dot / (na.sqrt() * nb.sqrt())
+}
+
 /// Load the local model once at worker startup: prefer the user's persisted
 /// choice (Settings, §I4), else fall back to `from_env()` (the
 /// `RHEMA_COMPREHENSION_MODEL` default). A persisted path uses `LlamaConfig`
@@ -118,6 +140,10 @@ pub async fn run_comprehension_worker(
         guard.session_active.clone()
     };
 
+    // Previous topic centroid for the optional topic-shift early trigger (I5, D5).
+    // Only consulted when the Observer's config has `topic_shift_trigger` enabled.
+    let mut prev_topic: Option<Vec<f32>> = None;
+
     while let Some(sentence) = rx.recv().await {
         if !session_active.load(Ordering::SeqCst) {
             continue;
@@ -132,13 +158,33 @@ pub async fn run_comprehension_worker(
         }
         let t = now_ms(base);
 
+        // Topic-shift early trigger (I5, D5). Read the current topic centroid
+        // (reusing the Phase-5.1 vector detection already maintains) and measure
+        // how far it moved. Fail open: if AppState is contended, skip the shift
+        // signal this tick (never block detection — mirrors stt.rs:1104). The
+        // Observer only acts on this when `topic_shift_trigger` is enabled.
+        let topic_shift: Option<f32> = {
+            let st = app.state::<Mutex<AppState>>();
+            let cur = st
+                .try_lock()
+                .ok()
+                .and_then(|mut g| g.sermon_context.topic_vector());
+            match cur {
+                Some(c) => {
+                    let shift = prev_topic.as_ref().map(|p| cosine_distance(p, &c));
+                    prev_topic = Some(c);
+                    shift
+                }
+                None => None,
+            }
+        };
+
         // Ingest + decide-to-evaluate under the Observer lock (brief).
         let (should, prompt) = {
             let obs_state = app.state::<Mutex<Observer>>();
             let mut obs = obs_state.lock().unwrap();
             obs.ingest_segment(&sentence, t);
-            // topic_shift wired in Task I5; None for now.
-            if obs.should_evaluate(t, None) {
+            if obs.should_evaluate(t, topic_shift) {
                 (true, obs.build_prompt())
             } else {
                 (false, String::new())
@@ -273,5 +319,36 @@ pub fn list_comprehension_models() -> Vec<ComprehensionModelInfo> {
         };
         out.sort_by(|a, b| a.label.cmp(&b.label));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cosine_distance;
+
+    #[test]
+    fn identical_vectors_have_zero_distance() {
+        let a = [1.0, 2.0, 3.0];
+        assert!(cosine_distance(&a, &a).abs() < 1e-6);
+    }
+
+    #[test]
+    fn orthogonal_vectors_have_distance_one() {
+        assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn opposite_vectors_have_distance_two() {
+        assert!((cosine_distance(&[1.0, 0.0], &[-1.0, 0.0]) - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dimension_mismatch_is_no_shift() {
+        assert_eq!(cosine_distance(&[1.0, 2.0], &[1.0]), 0.0);
+    }
+
+    #[test]
+    fn zero_norm_is_no_shift() {
+        assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
     }
 }
