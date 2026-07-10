@@ -30,6 +30,12 @@ interface SettingsState {
   sttStreaming: boolean | null
   vadEnabled: boolean
   commandWakeWord: string | null
+  /** Local comprehension observer on/off (I4). Applies live. */
+  comprehensionEnabled: boolean
+  /** Observer refresh interval in ms (I4). Applies live. Default 60s (§15). */
+  comprehensionIntervalMs: number
+  /** Selected comprehension GGUF (absolute path); null = env/backend default. Applies on next launch. */
+  comprehensionModel: string | null
   autoMode: boolean
   confidenceThreshold: number
   cooldownMs: number
@@ -50,6 +56,9 @@ interface SettingsState {
   setSttModel: (model: string | null, streaming: boolean | null) => void
   setVadEnabled: (enabled: boolean) => void
   setCommandWakeWord: (word: string | null) => void
+  setComprehensionEnabled: (enabled: boolean) => void
+  setComprehensionIntervalMs: (ms: number) => void
+  setComprehensionModel: (model: string | null) => void
   setAutoMode: (auto: boolean) => void
   setConfidenceThreshold: (threshold: number) => void
   setCooldownMs: (ms: number) => void
@@ -75,6 +84,10 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   })(),
   vadEnabled: false,
   commandWakeWord: null,
+  comprehensionEnabled: readLS("rhema.comprehensionEnabled") !== "false",
+  comprehensionIntervalMs:
+    Number(readLS("rhema.comprehensionIntervalMs")) || 60000,
+  comprehensionModel: readLS("rhema.comprehensionModel"),
   autoMode: false,
   confidenceThreshold: 0.8,
   cooldownMs: 2500,
@@ -98,6 +111,18 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   },
   setVadEnabled: (vadEnabled) => set({ vadEnabled }),
   setCommandWakeWord: (commandWakeWord) => set({ commandWakeWord }),
+  setComprehensionEnabled: (comprehensionEnabled) => {
+    writeLS("rhema.comprehensionEnabled", String(comprehensionEnabled))
+    set({ comprehensionEnabled })
+  },
+  setComprehensionIntervalMs: (comprehensionIntervalMs) => {
+    writeLS("rhema.comprehensionIntervalMs", String(comprehensionIntervalMs))
+    set({ comprehensionIntervalMs })
+  },
+  setComprehensionModel: (comprehensionModel) => {
+    writeLS("rhema.comprehensionModel", comprehensionModel)
+    set({ comprehensionModel })
+  },
   setAutoMode: (autoMode) => set({ autoMode }),
   setConfidenceThreshold: (confidenceThreshold) => set({ confidenceThreshold }),
   setCooldownMs: (cooldownMs) => set({ cooldownMs }),

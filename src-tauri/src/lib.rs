@@ -40,6 +40,8 @@ pub fn run() {
             60_000,
             4,
         )))
+        // Runtime enable gate for comprehension (interval lives on the Observer).
+        .manage(commands::comprehension::ComprehensionRuntime::default())
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,
@@ -73,6 +75,9 @@ pub fn run() {
             commands::stt::start_transcription,
             commands::stt::stop_transcription,
             commands::stt::list_stt_models,
+            commands::comprehension::set_comprehension_config,
+            commands::comprehension::set_comprehension_model,
+            commands::comprehension::list_comprehension_models,
             commands::broadcast::list_monitors,
             commands::broadcast::ensure_broadcast_window,
             commands::broadcast::open_broadcast_window,

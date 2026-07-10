@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/select"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Slider } from "@/components/ui/slider"
+import { Switch } from "@/components/ui/switch"
 import {
   Dialog,
   DialogContent,
@@ -487,6 +488,14 @@ function backendProvider(sel: LlmProviderSel): string | null {
   }
 }
 
+/** A local comprehension GGUF returned by `list_comprehension_models` (I4). */
+interface ComprehensionModelInfo {
+  path: string
+  label: string
+}
+
+const COMPREHENSION_INTERVALS = [10, 15, 20, 30, 45, 60]
+
 function AiModelSection() {
   const {
     llmProvider,
@@ -497,7 +506,28 @@ function AiModelSection() {
     setLlmApiKey,
     setLlmBaseUrl,
     setLlmModel,
+    comprehensionEnabled,
+    comprehensionIntervalMs,
+    comprehensionModel,
+    setComprehensionEnabled,
+    setComprehensionIntervalMs,
+    setComprehensionModel,
   } = useSettingsStore()
+
+  // Local comprehension model list (empty on a cloud-only build → dropdown hides).
+  const [compModels, setCompModels] = useState<ComprehensionModelInfo[]>([])
+  useEffect(() => {
+    invoke<ComprehensionModelInfo[]>("list_comprehension_models")
+      .then(setCompModels)
+      .catch(() => setCompModels([]))
+  }, [])
+
+  // Push the live-tunable config (enable + interval) to the running observer.
+  const pushComprehensionConfig = (enabled: boolean, intervalMs: number) => {
+    void invoke("set_comprehension_config", { enabled, intervalMs }).catch(
+      () => {}
+    )
+  }
 
   const [sel, setSel] = useState<LlmProviderSel>(
     (llmProvider as LlmProviderSel) ?? "auto"
@@ -636,6 +666,94 @@ function AiModelSection() {
           onChange={(e) => setModel(e.target.value)}
           className="text-xs"
         />
+      </div>
+
+      {/* -------------------------------------------------------------- */}
+      {/*  Comprehension (local observer, I4)                            */}
+      {/* -------------------------------------------------------------- */}
+      <div className="flex flex-col gap-4 border-t border-border pt-6">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex flex-col gap-1">
+            <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Comprehension (local)
+            </label>
+            <p className="text-[0.625rem] leading-relaxed text-muted-foreground">
+              A small on-device model watches the sermon and tracks what the
+              speaker is doing (teaching, storytelling, praying…). Read-only — it
+              never projects.
+            </p>
+          </div>
+          <Switch
+            checked={comprehensionEnabled}
+            onCheckedChange={(v) => {
+              setComprehensionEnabled(v)
+              pushComprehensionConfig(v, comprehensionIntervalMs)
+            }}
+          />
+        </div>
+
+        {/* Refresh interval */}
+        <div className="flex flex-col gap-2">
+          <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+            Refresh Interval
+          </label>
+          <Select
+            value={String(Math.round(comprehensionIntervalMs / 1000))}
+            onValueChange={(v) => {
+              const ms = Number(v) * 1000
+              setComprehensionIntervalMs(ms)
+              pushComprehensionConfig(comprehensionEnabled, ms)
+            }}
+          >
+            <SelectTrigger className="h-8 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {COMPREHENSION_INTERVALS.map((s) => (
+                <SelectItem key={s} value={String(s)}>
+                  {s} seconds
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-[0.625rem] text-muted-foreground">
+            How often the observer re-reads the sermon. Longer intervals cost
+            less CPU; detection responsiveness is unaffected.
+          </p>
+        </div>
+
+        {/* Model picker (only when local GGUFs are present) */}
+        {compModels.length > 0 && (
+          <div className="flex flex-col gap-2">
+            <label className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+              Comprehension Model
+            </label>
+            <Select
+              value={comprehensionModel ?? "__default__"}
+              onValueChange={(v) => {
+                const path = v === "__default__" ? null : v
+                setComprehensionModel(path)
+                void invoke("set_comprehension_model", { path }).catch(() => {})
+              }}
+            >
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue placeholder="Default" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__default__">Default (env)</SelectItem>
+                {compModels.map((m) => (
+                  <SelectItem key={m.path} value={m.path}>
+                    {m.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-[0.625rem] text-muted-foreground">
+              On-device GGUF; persists across restarts and applies on the next
+              app launch (the model loads once at startup).
+            </p>
+          </div>
+        )}
       </div>
     </div>
   )

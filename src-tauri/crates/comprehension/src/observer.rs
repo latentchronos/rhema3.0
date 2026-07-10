@@ -121,6 +121,13 @@ impl Observer {
         self.current.as_ref()
     }
 
+    /// Update the fixed refresh interval live (§5.2). Driven by the settings UI
+    /// (Phase I4); pure, so it stays unit-testable. Takes effect on the next
+    /// `should_evaluate` check.
+    pub fn set_interval(&mut self, ms: u64) {
+        self.config.interval_ms = ms;
+    }
+
     /// Reset all working memory for a new service (§14C).
     pub fn clear_session(&mut self) {
         self.current = None;
@@ -242,6 +249,15 @@ mod tests {
             .expect("a transition");
         assert_eq!(t.from, Some(first));
         assert_eq!(t.to, second);
+    }
+
+    #[test]
+    fn set_interval_changes_when_evaluation_is_due() {
+        let mut o = observer(); // default interval 60_000
+        o.ingest_segment("hi", 1_000);
+        assert!(!o.should_evaluate(30_000, None)); // 30s < 60s ceiling
+        o.set_interval(10_000);
+        assert!(o.should_evaluate(30_000, None)); // now 30s >= 10s
     }
 
     #[test]
