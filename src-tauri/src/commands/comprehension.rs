@@ -102,9 +102,6 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Whether a due comprehension tick should run now, given STT load (STT-backlog gate).
-/// `allow(dead_code)`: wired into `run_comprehension_worker` in the next bullet (the gate
-/// consumer); until then only the unit tests exercise it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunDecision {
     /// STT is caught up (or the starvation valve fired) — run the inference tick.
@@ -124,7 +121,6 @@ enum RunDecision {
 /// A `Skip` loses nothing: `should_evaluate` is a pure query and `last_eval_ms` only
 /// advances in `apply_decision`, so the tick is re-checked against a fresh backlog
 /// reading on the next sentence and resumes the moment STT drains below `max`.
-#[allow(dead_code)] // consumed by run_comprehension_worker in the next bullet
 fn decide_run(
     due: bool,
     backlog: usize,
@@ -207,6 +203,20 @@ pub async fn run_comprehension_worker(
     // Only consulted when the Observer's config has `topic_shift_trigger` enabled.
     let mut prev_topic: Option<Vec<f32>> = None;
 
+    // STT-backlog gate config (I6 freeze fix), read once. Skip a due tick while STT is
+    // behind and retry on the next sentence; force a run after the valve ceiling so the
+    // panel can't go indefinitely stale under a sustained-loud passage.
+    let backlog_max: usize = std::env::var("RHEMA_COMPREHENSION_STT_BACKLOG_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let backlog_force_ms: u64 = std::env::var("RHEMA_COMPREHENSION_STT_BACKLOG_FORCE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(180_000);
+    let backlog_gauge = app.state::<SttBacklogGauge>().0.clone();
+    let mut deferred_since: Option<u64> = None;
+
     while let Some(sentence) = rx.recv().await {
         if !session_active.load(Ordering::SeqCst) {
             continue;
@@ -242,20 +252,42 @@ pub async fn run_comprehension_worker(
             }
         };
 
-        // Ingest + decide-to-evaluate under the Observer lock (brief).
-        let (should, prompt) = {
+        // Ingest every final sentence + check whether a tick is due (pure query).
+        let due = {
             let obs_state = app.state::<Mutex<Observer>>();
             let mut obs = obs_state.lock().unwrap();
             obs.ingest_segment(&sentence, t);
-            if obs.should_evaluate(t, topic_shift) {
-                (true, obs.build_prompt())
-            } else {
-                (false, String::new())
-            }
+            obs.should_evaluate(t, topic_shift)
         };
-        if !should {
-            continue;
+
+        // STT-backlog gate (I6 freeze fix): don't add LLM load while STT is already behind.
+        // A skipped tick is re-offered on the next final sentence (should_evaluate is pure;
+        // last_eval_ms only advances in apply_decision), so it resumes the moment STT drains
+        // below the threshold. The valve forces a run after `backlog_force_ms` of deferral.
+        let backlog = backlog_gauge.load(Ordering::Relaxed);
+        let was_deferring = deferred_since.is_some();
+        let (run_decision, next_deferred) =
+            decide_run(due, backlog, backlog_max, t, deferred_since, backlog_force_ms);
+        deferred_since = next_deferred;
+        match run_decision {
+            RunDecision::Idle => continue,
+            RunDecision::Skip => {
+                if !was_deferring {
+                    log::info!(
+                        "[comprehension] deferring tick: STT backlog {backlog} > {backlog_max}"
+                    );
+                }
+                continue;
+            }
+            RunDecision::Run => {}
         }
+
+        // Decided to run — build the Σ/Δ prompt now (brief lock).
+        let prompt = {
+            let obs_state = app.state::<Mutex<Observer>>();
+            let obs = obs_state.lock().unwrap();
+            obs.build_prompt()
+        };
 
         // Inference happens OUTSIDE the lock (it can take seconds) AND on a
         // blocking thread (spawn_blocking) so it never stalls the async runtime.
