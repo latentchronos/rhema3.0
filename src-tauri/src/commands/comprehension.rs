@@ -6,8 +6,8 @@
 //! configured) the worker simply drains the feed channel and no events fire, so
 //! the default build stays native-free and green.
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -20,6 +20,18 @@ use crate::state::AppState;
 /// Managed holder for the sentence-feed sender (filled at setup). The STT
 /// detection worker taps coalesced sentences into this channel.
 pub struct ComprehensionFeed(pub Mutex<Option<tokio::sync::mpsc::Sender<String>>>);
+
+/// Live STT queued-frame backlog (= `deepgram_tx.len()`), published by the STT fanout
+/// thread and read by the comprehension worker's STT-backlog gate. `0` when idle. Only the
+/// depth is shared — never a `Sender` clone, which would keep the audio channel alive and
+/// break the engine's `Disconnected` detection.
+pub struct SttBacklogGauge(pub Arc<AtomicUsize>);
+
+impl Default for SttBacklogGauge {
+    fn default() -> Self {
+        Self(Arc::new(AtomicUsize::new(0)))
+    }
+}
 
 /// Runtime-tunable comprehension controls pushed from Settings (I4). The enable
 /// gate is read by the worker each tick (the interval lives on the managed

@@ -42,6 +42,9 @@ pub fn run() {
         )))
         // Runtime enable gate for comprehension (interval lives on the Observer).
         .manage(commands::comprehension::ComprehensionRuntime::default())
+        // Live STT backlog gauge — published by the STT fanout thread, read by the
+        // comprehension worker to skip inference ticks while STT is behind (I6 freeze fix).
+        .manage(commands::comprehension::SttBacklogGauge::default())
         .invoke_handler(tauri::generate_handler![
             commands::bible::list_translations,
             commands::bible::list_books,

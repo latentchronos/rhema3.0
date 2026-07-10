@@ -287,6 +287,14 @@ pub async fn start_transcription(
         .map(|s| s.trim().to_lowercase());
     let fan_active = stt_active.clone();
     let fan_app = app.clone();
+    // Live STT backlog gauge (I6 freeze fix): the fanout thread publishes the queued-frame
+    // depth so the comprehension worker can skip inference ticks while STT is behind. Reset
+    // to 0 for a fresh session so a prior session's stale-high value can't wrongly gate.
+    let backlog_gauge = app
+        .state::<crate::commands::comprehension::SttBacklogGauge>()
+        .0
+        .clone();
+    backlog_gauge.store(0, Ordering::Relaxed);
 
     std::thread::Builder::new()
         .name("audio-fanout".into())
@@ -394,6 +402,8 @@ pub async fn start_transcription(
                         if deepgram_tx.try_send(frame.samples).is_err() {
                             rhema_detection::metrics::log_channel_drop("deepgram");
                         }
+                        // Publish the current queued-frame backlog for the comprehension gate.
+                        backlog_gauge.store(deepgram_tx.len(), Ordering::Relaxed);
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -402,6 +412,7 @@ pub async fn start_transcription(
 
             // Dropping `capture` stops the cpal stream.
             capture.stop();
+            backlog_gauge.store(0, Ordering::Relaxed); // no session -> no backlog
             log::info!("Audio capture stopped on fanout thread");
         })
         .map_err(|e| {
