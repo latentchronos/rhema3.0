@@ -211,7 +211,13 @@ export function TranscriptPanel() {
     document.body.appendChild(a)
     a.click()
     a.remove()
-    URL.revokeObjectURL(url)
+    // Defer revocation. Tauri on Linux runs a WebKitGTK webview whose anchor-download
+    // reads the blob ASYNCHRONOUSLY (unlike Chromium, which reads it synchronously on
+    // click). Revoking the object URL immediately races that read and truncates the file —
+    // header + a few lines, the rest lost, amount varying per run. The larger the blob the
+    // worse it is, which is why exporting the full `fullLog` (vs the small windowed
+    // `segments`) surfaced it. Hold the URL alive well past the read, then release it.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
   }
 
   return (
